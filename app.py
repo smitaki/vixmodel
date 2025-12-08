@@ -1,15 +1,12 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-from sklearn.cluster import KMeans
 
-# ----------------------------------------------------
-# CONFIGURATION & SETUP
-# ----------------------------------------------------
+# -----------------------------------------------------------------------------
+# 1. PAGE CONFIGURATION
+# -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="VIX Spike Predictor",
     page_icon="🛡️",
@@ -17,251 +14,198 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Constants
-SPIKE_THRESHOLD = 0.30
-ROLLING_WINDOW = 30
-START_DATE = "1990-01-01"
-VIX_PREMIUM = 4.5
-SEASONAL_DAYS_TO_SPIKE = {
-    1: 32, 2: 25, 3: 18, 4: 20, 5: 35, 6: 40,
-    7: 38, 8: 22, 9: 15, 10: 16, 11: 30, 12: 28
-}
-
-# ----------------------------------------------------
-# DATA & PROCESSING
-# ----------------------------------------------------
-@st.cache_data(ttl=60)
+# -----------------------------------------------------------------------------
+# 2. DATA LOADING (REPLACE WITH YOUR ACTUAL DATA LOGIC)
+# -----------------------------------------------------------------------------
+@st.cache_data
 def load_data():
-    ticker = "^VIX"
-    # Download data
-    data = yf.download(ticker, start=START_DATE, progress=False)
+    # --- MOCK DATA GENERATION (DELETE THIS BLOCK IN PROD) ---
+    dates = pd.date_range(start="2024-01-01", end="2025-12-08", freq="B")
+    n = len(dates)
     
-    if data.empty:
-        return None
-
-    # Handle MultiIndex if present
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    
-    df = data.reset_index()
-    
-    # Normalize columns
-    df.columns = [c.upper() for c in df.columns]
-    if 'DATE' not in df.columns:
-        df = df.rename(columns={'Date': 'DATE'})
+    # Simulate VIX-like Mean Reverting Series
+    np.random.seed(42)
+    prices = [15.0]
+    for _ in range(n-1):
+        change = np.random.normal(0, 0.5) + 0.1 * (15 - prices[-1]) # Mean reversion to 15
+        prices.append(max(10, prices[-1] + change))
         
-    df['DATE'] = pd.to_datetime(df['DATE'])
-    df = df.sort_values("DATE").reset_index(drop=True)
+    df = pd.DataFrame({'Date': dates, 'Close': prices})
     
-    # ----------------------------
-    # Feature Engineering (Paper Implementation)
-    # ----------------------------
-    df["daily_return"] = df["CLOSE"].pct_change()
+    # Calculate Indicators (Replicating your logic roughly)
+    df['rolling_mean_20d'] = df['Close'].rolling(20).mean()
+    df['rolling_std_20d'] = df['Close'].rolling(20).std()
+    df['bollinger_upper'] = df['rolling_mean_20d'] + (2 * df['rolling_std_20d'])
+    df['bollinger_lower'] = df['rolling_mean_20d'] - (2 * df['rolling_std_20d'])
     
-    # Volatility & Bands
-    df["rolling_mean_20d"] = df["CLOSE"].rolling(20).mean()
-    df["rolling_std_20d"] = df["CLOSE"].rolling(20).std()
-    df["bollinger_upper"] = df["rolling_mean_20d"] + (df["rolling_std_20d"] * 2)
-    df["bollinger_lower"] = df["rolling_mean_20d"] - (df["rolling_std_20d"] * 2)
+    # VCR / Z-Score mock calculation
+    df['z_score'] = (df['Close'] - df['rolling_mean_20d']) / df['rolling_std_20d']
+    df['vcr'] = (df['Close'] / df['rolling_mean_20d'] - 1) * 100  # Example metric
     
-    # Paper Metrics
-    df["rolling_vol_30d"] = df["daily_return"].rolling(30).std() * np.sqrt(252)
-    df["skew_30d"] = df["daily_return"].rolling(30).skew()
-    df["kurt_30d"] = df["daily_return"].rolling(30).kurt()
+    # Logic for Signal
+    df['regime'] = np.where(df['Close'] > 20, 'Elevated', 'Normal')
+    df['signal'] = np.where(df['z_score'] > 2.0, 'SPIKE WARNING', 'HOLD')
+    df['daily_return'] = df['Close'].pct_change()
     
-    # Expected VIX & VCR (VIX Change Ratio)
-    # The paper suggests VIX often reverts. We calculate the premium.
-    df["expected_vix"] = df["rolling_vol_30d"] + (df["CLOSE"].rolling(30).mean() - df["CLOSE"]) * 0.5 + VIX_PREMIUM
-    df["vcr"] = (df["CLOSE"] - df["expected_vix"]) / df["expected_vix"]
-    df["spike_premium"] = df["CLOSE"] - df["expected_vix"]
-    
-    # Z-Score (For "Movements by Standard" metric)
-    df["z_score"] = (df["CLOSE"] - df["rolling_mean_20d"]) / df["rolling_std_20d"]
+    return df.sort_values('Date', ascending=True).reset_index(drop=True)
 
-    # Regime Classification
-    df["regime"] = pd.qcut(df["CLOSE"], q=4, labels=["Calm", "Normal", "Elevated", "Stressed"])
-
-    # ----------------------------
-    # Signal Logic
-    # ----------------------------
-    # We execute the signal logic on the very last row effectively, 
-    # but we calculate hist analogs for the whole set for context if needed.
-    df["signal"] = "HOLD"
-    df["signal_reason"] = "Monitoring market conditions."
-    
-    # Only process signals for the most recent valid data point
-    if len(df) > 30:
-        latest = df.iloc[-1]
-        
-        # Simple Clustering logic for signal generation context
-        # (Simplified for performance)
-        spike_prob = 0.0
-        
-        # LOGIC 1: Calm Regime + High VCR (Complacency)
-        if (latest["regime"] == "Calm") and (latest["vcr"] > 0.02):
-            df.at[df.index[-1], "signal"] = "BUY VIX CALLS"
-            df.at[df.index[-1], "signal_reason"] = f"Paper Signal: Calm Regime + High VCR ({latest['vcr']:.2%}) indicates complacency."
-            
-        # LOGIC 2: Fat Tails (Kurtosis)
-        elif (latest["regime"] in ["Calm", "Normal"]) and (latest["kurt_30d"] > 1.5):
-            df.at[df.index[-1], "signal"] = "STRONG BUY VIX CALLS"
-            df.at[df.index[-1], "signal_reason"] = f"Tail Risk: High Kurtosis ({latest['kurt_30d']:.1f}) implies elevated crash probability."
-
-        # LOGIC 3: Stressed + Negative VCR (Mean Reversion)
-        elif (latest["regime"] == "Stressed") and (latest["vcr"] < -0.05):
-            df.at[df.index[-1], "signal"] = "SELL VIX"
-            df.at[df.index[-1], "signal_reason"] = f"Mean Reversion: Stressed levels + Negative VCR ({latest['vcr']:.2%})."
-
-    return df
-
-# ----------------------------------------------------
-# STREAMLIT UI LAYOUT
-# ----------------------------------------------------
-
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Settings")
-    auto_refresh = st.toggle("Auto-refresh (60s)", value=True)
-    if st.button("🔄 Refresh Data"):
-        st.cache_data.clear()
-        st.rerun()
-    
-    st.divider()
-    st.markdown("### 📚 Model Info")
-    st.info("""
-    **VCR Model:** Calculates the gap between Spot VIX and 'Expected' VIX based on mean reversion and volatility premium.
-    
-    **Bollinger Bands:** 2 Standard Deviations (20D).
-    """)
-
-# Main Content
-st.title("🛡️ VIX Spike Predictor")
-st.markdown("##### *Standardized Volatility Analysis & Historical Analogs*")
-
-# Load Data
+# Load data
 df = load_data()
 
-if df is None:
-    st.error("Error loading VIX data. Please try again.")
-    st.stop()
+# -----------------------------------------------------------------------------
+# 3. SIDEBAR CONTROLS
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Settings")
+    st.markdown("---")
+    
+    # Date Filter
+    min_date = df['Date'].min().date()
+    max_date = df['Date'].max().date()
+    
+    start_date, end_date = st.slider(
+        "Select Date Range",
+        min_value=min_date,
+        max_value=max_date,
+        value=(min_date, max_date),
+        format="YYYY-MM-DD"
+    )
+    
+    st.markdown("### Model Parameters")
+    st.info("Adjusting these affects the chart visualization.")
+    show_bollinger = st.checkbox("Show Bollinger Bands", value=True)
+    show_signals = st.checkbox("Show Spike Signals", value=True)
 
+# Filter data based on selection
+mask = (df['Date'].dt.date >= start_date) & (df['Date'].dt.date <= end_date)
+df_filtered = df.loc[mask]
+
+# -----------------------------------------------------------------------------
+# 4. KPI HEADER (METRICS)
+# -----------------------------------------------------------------------------
+st.title("🛡️ VIX Spike Predictor")
+st.markdown("### Standardized Volatility Analysis & Historical Analogs")
+
+# Get latest values
 latest = df.iloc[-1]
 prev = df.iloc[-2]
+delta_vix = latest['Close'] - prev['Close']
 
-# Top Level Metrics
-m1, m2, m3, m4, m5 = st.columns(5)
+col1, col2, col3, col4, col5 = st.columns(5)
 
-# Color logic for price change
-price_color = "normal"
-if latest["CLOSE"] > prev["CLOSE"]: price_color = "inverse" # Red for VIX up usually means bad for market, but standard here
+with col1:
+    st.metric("VIX Level", f"{latest['Close']:.2f}", f"{delta_vix:.2f}")
+with col2:
+    regime_color = "normal" if latest['regime'] == 'Normal' else "inverse"
+    st.metric("Regime", latest['regime'], delta_color="off")
+with col3:
+    st.metric("VCR Metric", f"{latest['vcr']:.2f}%", help="Volatility Convergence Ratio")
+with col4:
+    st.metric("Z-Score", f"{latest['z_score']:.2f}σ")
+with col5:
+    # Highlight signal if active
+    if latest['signal'] != 'HOLD':
+        st.error(f"⚠️ {latest['signal']}")
+    else:
+        st.success(latest['signal'])
 
-m1.metric("VIX Level", f"{latest['CLOSE']:.2f}", f"{latest['CLOSE'] - prev['CLOSE']:.2f}")
-m2.metric("Regime", latest["regime"])
-m3.metric("VCR (Paper Metric)", f"{latest['vcr']:.2%}", help="VIX Change Ratio. >2% in Calm regime suggests spike.")
-m4.metric("Z-Score (Std Dev)", f"{latest['z_score']:.2f}σ", help="Standard Deviations from 20D Mean")
-m5.metric("Est. Days to Spike", f"~{SEASONAL_DAYS_TO_SPIKE.get(latest['DATE'].month, 28)}")
+st.markdown("---")
 
-# Signal Banner
-signal_color = "blue"
-if "STRONG BUY" in latest["signal"]: signal_color = "green"
-elif "BUY" in latest["signal"]: signal_color = "green"
-elif "SELL" in latest["signal"]: signal_color = "red"
+# -----------------------------------------------------------------------------
+# 5. DYNAMIC CHART (PLOTLY)
+# -----------------------------------------------------------------------------
+# Create subplots: Row 1 = Price, Row 2 = Z-Score/Indicator
+fig = make_subplots(
+    rows=2, cols=1, 
+    shared_xaxes=True, 
+    vertical_spacing=0.05, 
+    row_heights=[0.7, 0.3], # Main chart takes 70% space
+    subplot_titles=("VIX Price Action & Bollinger Bands", "Z-Score (Deviation Metric)")
+)
 
-if latest["signal"] != "HOLD":
-    st.markdown(f"""
-    <div style="padding: 15px; border-radius: 10px; background-color: rgba(0,255,0,0.1) if 'BUY' in '{latest['signal']}' else rgba(255,0,0,0.1); border: 1px solid {signal_color}; margin-bottom: 20px;">
-        <h3 style="color:{signal_color}; margin:0;">🚀 SIGNAL: {latest['signal']}</h3>
-        <p style="margin:0;"><b>Reason:</b> {latest['signal_reason']}</p>
-    </div>
-    """, unsafe_allow_html=True)
+# --- TRACE 1: VIX Close Price ---
+fig.add_trace(go.Scatter(
+    x=df_filtered['Date'], 
+    y=df_filtered['Close'], 
+    mode='lines', 
+    name='VIX',
+    line=dict(color='#00d4ff', width=2)
+), row=1, col=1)
 
-# ----------------------------------------------------
-# MAIN CHART (Standardized + Zoom)
-# ----------------------------------------------------
-tab1, tab2 = st.tabs(["📊 Interactive Analysis", "🔢 Historical Data"])
-
-with tab1:
-    # Create Subplots: Row 1 = Price + Bands, Row 2 = VCR (Paper Metric)
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.05, row_heights=[0.7, 0.3])
-
-    # --- Candlestick Chart (Price) ---
-    fig.add_trace(go.Candlestick(
-        x=df['DATE'], open=df['OPEN'], high=df['HIGH'], low=df['LOW'], close=df['CLOSE'],
-        name="VIX"
-    ), row=1, col=1)
-
-    # --- Bollinger Bands (The "Standard" Movement) ---
+# --- TRACE 2: Bollinger Bands (Optional) ---
+if show_bollinger:
+    # Upper Band
     fig.add_trace(go.Scatter(
-        x=df['DATE'], y=df['bollinger_upper'], mode='lines', 
-        line=dict(width=1, color='gray', dash='dot'), name='Upper Band (2σ)'
+        x=df_filtered['Date'], y=df_filtered['bollinger_upper'],
+        mode='lines', line=dict(width=1, color='rgba(150, 150, 150, 0.5)'),
+        showlegend=False, name='Upper BB'
     ), row=1, col=1)
     
+    # Lower Band (Filled)
     fig.add_trace(go.Scatter(
-        x=df['DATE'], y=df['bollinger_lower'], mode='lines', 
-        line=dict(width=1, color='gray', dash='dot'), name='Lower Band (2σ)',
-        fill='tonexty', fillcolor='rgba(200, 200, 200, 0.1)'
+        x=df_filtered['Date'], y=df_filtered['bollinger_lower'],
+        mode='lines', line=dict(width=1, color='rgba(150, 150, 150, 0.5)'),
+        fill='tonexty', # Fills area between Upper and Lower
+        fillcolor='rgba(150, 150, 150, 0.1)',
+        showlegend=False, name='Lower BB'
     ), row=1, col=1)
 
-    # --- Signal Markers ---
-    # Filter for signals (just last year for cleanliness)
-    recent_sigs = df[df['DATE'] > (datetime.now() - timedelta(days=365))]
-    buy_sigs = recent_sigs[recent_sigs["signal"].str.contains("BUY")]
-    
-    if not buy_sigs.empty:
-        fig.add_trace(go.Scatter(
-            x=buy_sigs["DATE"], y=buy_sigs["LOW"]*0.95, mode='markers',
-            marker=dict(symbol='triangle-up', size=12, color='blue'),
-            name='Signal'
-        ), row=1, col=1)
+# --- TRACE 3: Buy/Spike Signals ---
+if show_signals:
+    # Filter only rows where signal is NOT 'HOLD'
+    signals = df_filtered[df_filtered['signal'] != 'HOLD']
+    fig.add_trace(go.Scatter(
+        x=signals['Date'], y=signals['Close'],
+        mode='markers', 
+        marker=dict(symbol='triangle-up', color='red', size=12, line=dict(width=2, color='white')),
+        name='Spike Alert'
+    ), row=1, col=1)
 
-    # --- VCR Chart (Paper Metric) ---
-    fig.add_trace(go.Bar(
-        x=df['DATE'], y=df['vcr'], name='VCR',
-        marker_color=np.where(df['vcr'] > 0, 'red', 'green') # Red VCR (positive) usually precedes spikes
-    ), row=2, col=1)
-    
-    # Add VCR Threshold line from paper
-    fig.add_hline(y=0.02, line_dash="dash", line_color="red", row=2, col=1, annotation_text="Danger Zone (>0.02)")
+# --- TRACE 4: Z-Score (Bottom Panel) ---
+fig.add_trace(go.Bar(
+    x=df_filtered['Date'], y=df_filtered['z_score'],
+    name='Z-Score',
+    marker_color=np.where(df_filtered['z_score'] > 2, 'red', 'gray') # Color spikes red
+), row=2, col=1)
 
-    # --- Layout & Zoom ---
-    fig.update_layout(
-        title="VIX Price Action relative to Standard Deviation (Bollinger Bands)",
-        yaxis_title="VIX Price",
-        height=700,
-        xaxis_rangeslider_visible=False, # We use the selector instead
-        hovermode="x unified",
-        margin=dict(l=20, r=20, t=50, b=20),
-        legend=dict(orientation="h", y=1.02, x=0, xanchor="left")
-    )
+# Add "Danger Zone" line on subplot
+fig.add_hline(y=2.0, line_dash="dot", line_color="red", annotation_text="Danger (>2σ)", row=2, col=1)
 
-    # The Range Selector (Zoom Out Capability)
-    fig.update_xaxes(
-        rangeselector=dict(
-            buttons=list([
-                dict(count=1, label="1m", step="month", stepmode="backward"),
-                dict(count=3, label="3m", step="month", stepmode="backward"),
-                dict(count=6, label="6m", step="month", stepmode="backward"),
-                dict(count=1, label="YTD", step="year", stepmode="todate"),
-                dict(count=1, label="1y", step="year", stepmode="backward"),
-                dict(step="all")
-            ])
-        )
-    )
+# --- LAYOUT POLISH ---
+fig.update_layout(
+    height=600,
+    margin=dict(l=20, r=20, t=30, b=20),
+    template="plotly_dark",
+    hovermode="x unified",
+    legend=dict(orientation="h", y=1.02, xanchor="right", x=1)
+)
 
-    # Auto-zoom to last 6 months initially for cleaner look
-    six_months_ago = datetime.now() - timedelta(days=180)
-    fig.update_xaxes(range=[six_months_ago, datetime.now()])
+# Render Chart
+st.plotly_chart(fig, use_container_width=True)
 
-    st.plotly_chart(fig, use_container_width=True)
+# -----------------------------------------------------------------------------
+# 6. ENHANCED DATA TABLE
+# -----------------------------------------------------------------------------
+st.subheader("📋 Historical Data Ledger")
 
-with tab2:
-    st.dataframe(df.sort_values("DATE", ascending=False).head(100), use_container_width=True)
+# Select clean columns for display
+display_cols = ['Date', 'Close', 'signal', 'regime', 'vcr', 'z_score', 'daily_return', 'rolling_std_20d']
 
-# ----------------------------------------------------
-# AUTO REFRESH LOGIC
-# ----------------------------------------------------
-if auto_refresh:
-    import time
-    time.sleep(60)
-    st.rerun()
+# Sort by newest first
+df_display = df_filtered[display_cols].sort_values('Date', ascending=False)
+
+st.dataframe(
+    df_display,
+    use_container_width=True,
+    height=400,
+    hide_index=True,
+    column_config={
+        "Date": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
+        "Close": st.column_config.NumberColumn("VIX Level", format="%.2f"),
+        "daily_return": st.column_config.NumberColumn("1D Chg", format="%.2f%%"),
+        "vcr": st.column_config.NumberColumn("VCR Metric", format="%.2f%%"),
+        "z_score": st.column_config.NumberColumn("Z-Score", format="%.2f"),
+        "signal": st.column_config.TextColumn("Signal", help="Model Trigger"),
+        "regime": st.column_config.TextColumn("Regime", width="small"),
+    }
+)
