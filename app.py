@@ -148,17 +148,28 @@ if df is None:
 latest = df.iloc[-1]
 mean_vix = df["CLOSE"].mean()
 
-# Metrics
+# Metrics - larger and colored
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("VIX Close", f"{latest['CLOSE']:.2f}", f"{latest['daily_return']:.2%}")
 c2.metric("Regime", latest["regime"].capitalize())
 c3.metric("Rolling Vol", f"{latest['rolling_vol_30d']:.2f}")
 c4.metric("Long-term Mean", f"{mean_vix:.2f}")
 
-# Signal
+# Signal - bold and colored
 signal = latest["signal"]
 reason = latest.get("signal_reason", "Monitoring")
-st.markdown(f"### **SIGNAL: {signal.replace('_', ' ')}**")
+
+if "STRONG_BUY" in signal:
+    st.success(f"### **SIGNAL: {signal.replace('_', ' ')}**")
+elif "BUY" in signal:
+    st.success(f"### **SIGNAL: {signal.replace('_', ' ')}**")
+elif "STRONG_SELL" in signal:
+    st.error(f"### **SIGNAL: {signal.replace('_', ' ')}**")
+elif "SELL" in signal:
+    st.warning(f"### **SIGNAL: {signal.replace('_', ' ')}**")
+else:
+    st.info(f"### **SIGNAL: {signal.replace('_', ' ')}**")
+
 st.markdown(f"**Reason:** {reason}")
 st.markdown(f"**Seasonal Outlook:** ~{SEASONAL_DAYS_TO_SPIKE.get(latest['DATE'].month, 28)} days to potential spike")
 
@@ -174,17 +185,17 @@ if "BUY" in signal:
           → [CBOE](https://www.cboe.com/tradable-products/vix/vix-options)
         """)
 
-# Interactive Plotly Chart - LIGHT THEME FOR BETTER READABILITY
+# Interactive Plotly Chart - VISUALLY ENHANCED
 fig = go.Figure()
 
-fig.add_trace(go.Scatter(x=df["DATE"], y=df["CLOSE"], mode='lines', name='VIX Close', line=dict(color='black')))
+fig.add_trace(go.Scatter(x=df["DATE"], y=df["CLOSE"], mode='lines', name='VIX Close', line=dict(color='black', width=2)))
 
 buy = df[df["signal"].str.contains("BUY_VIX_CALLS", na=False)]
 sell = df[df["signal"].str.contains("SELL_VIX", na=False)]
 fig.add_trace(go.Scatter(x=buy["DATE"], y=buy["CLOSE"], mode='markers', name='BUY VIX CALLS',
-                         marker=dict(symbol='triangle-up', size=12, color='green')))
+                         marker=dict(symbol='triangle-up', size=14, color='green', line=dict(width=2))))
 fig.add_trace(go.Scatter(x=sell["DATE"], y=sell["CLOSE"], mode='markers', name='SELL VIX',
-                         marker=dict(symbol='triangle-down', size=12, color='red')))
+                         marker=dict(symbol='triangle-down', size=14, color='red', line=dict(width=2))))
 
 qs = df["CLOSE"].quantile([0.25, 0.5, 0.75])
 fig.add_hline(y=qs[0.25], line_dash="dash", line_color="green", annotation_text="Calm Threshold")
@@ -193,16 +204,27 @@ fig.add_hline(y=qs[0.75], line_dash="dash", line_color="red", annotation_text="S
 fig.add_hline(y=mean_vix, line_dash="dot", line_color="blue", annotation_text="Long-term Mean")
 fig.add_hline(y=mean_vix*0.95, line_dash="dashdot", line_color="purple", annotation_text="95% Mean Trigger")
 
-# Force light theme for readability (white background, black grid)
 fig.update_layout(
     title="Interactive VIX with Signals",
-    height=600,
+    height=700,
     hovermode="x unified",
-    template="plotly_white",  # Light background
+    template="plotly_white",
     plot_bgcolor="white",
     paper_bgcolor="white",
-    font=dict(color="black")
+    font=dict(color="black", size=12),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom", y=1.02,
+        xanchor="left", x=0,
+        bgcolor="rgba(255,255,255,0.9)",
+        bordercolor="gray",
+        borderwidth=1
+    ),
+    margin=dict(l=50, r=50, t=100, b=50)
 )
+
+fig.update_yaxes(gridcolor="lightgray", zerolinecolor="gray")
+fig.update_xaxes(gridcolor="lightgray")
 
 st.plotly_chart(fig, use_container_width=True)
 
@@ -220,4 +242,5 @@ with st.expander("Historical & Seasonal Stats"):
         for m in range(1, 13):
             st.write(f"{datetime(2025, m, 1).strftime('%B')}: ~{SEASONAL_DAYS_TO_SPIKE[m]} days")
 
+st.divider()
 st.caption("Math-based VIX spike predictor | Not financial advice")
