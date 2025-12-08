@@ -7,24 +7,34 @@ import plotly.graph_objects as go
 from datetime import datetime
 from sklearn.cluster import KMeans
 
-# Force light mode for the entire app
 st.set_page_config(page_title="VIX Spike Predictor", layout="wide")
 
-# Custom CSS to enforce light theme globally
+# FULL LIGHT MODE CSS OVERRIDE
 st.markdown("""
 <style>
-    .reportview-container {
-        background: #ffffff;
-        color: #000000;
+    /* Main app background and text */
+    .stApp {
+        background-color: white !important;
+        color: black !important;
     }
-    .sidebar .sidebar-content {
-        background: #f0f2f6;
+    .css-1d391kg, .css-18e3th9, .css-fblp2m {
+        background-color: white !important;
     }
-    .css-1d391kg {
-        background: #ffffff;
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: #f0f2f6 !important;
     }
-    h1, h2, h3, h4, h5, h6, p, div, span, label {
-        color: #000000 !important;
+    /* Text and headers */
+    h1, h2, h3, h4, h5, h6, p, div, span, label, .stMarkdown {
+        color: black !important;
+    }
+    /* Metrics and buttons */
+    .css-1xarl3l, .css-1offfwp, .css-1v0mbdj {
+        color: black !important;
+    }
+    /* Expander and divider */
+    .streamlit-expanderHeader {
+        color: black !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -141,7 +151,7 @@ def load_and_process_data():
     return df
 
 # ----------------------------------------------------
-# STREAMLIT APP - FULL LIGHT MODE
+# STREAMLIT APP
 # ----------------------------------------------------
 st.title("🛡️ VIX Spike Predictor Dashboard")
 st.markdown("Real-time VIX analysis with historical analogs and call-buying signals")
@@ -168,14 +178,14 @@ if df is None:
 latest = df.iloc[-1]
 mean_vix = df["CLOSE"].mean()
 
-# Metrics
+# Metrics - larger and colored
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("VIX Close", f"{latest['CLOSE']:.2f}", f"{latest['daily_return']:.2%}")
 c2.metric("Regime", latest["regime"].capitalize())
 c3.metric("Rolling Vol", f"{latest['rolling_vol_30d']:.2f}")
 c4.metric("Long-term Mean", f"{mean_vix:.2f}")
 
-# Signal with color
+# Signal - bold and colored
 signal = latest["signal"]
 reason = latest.get("signal_reason", "Monitoring")
 
@@ -205,7 +215,7 @@ if "BUY" in signal:
           → [CBOE](https://www.cboe.com/tradable-products/vix/vix-options)
         """)
 
-# Interactive Plotly Chart - FULL LIGHT MODE & ENHANCED VISUALS
+# Interactive Plotly Chart - VISUALLY ENHANCED & LIGHT MODE
 fig = go.Figure()
 
 fig.add_trace(go.Scatter(x=df["DATE"], y=df["CLOSE"], mode='lines', name='VIX Close', line=dict(color='black', width=2)))
@@ -246,8 +256,7 @@ fig.update_layout(
 fig.update_yaxes(gridcolor="lightgray", zerolinecolor="gray")
 fig.update_xaxes(gridcolor="lightgray")
 
-# Force light theme in Streamlit chart display
-st.plotly_chart(fig, use_container_width=True, theme=None)
+st.plotly_chart(fig, use_container_width=True, theme=None)  # theme=None ensures light chart
 
 # Historical stats
 with st.expander("Historical & Seasonal Stats"):
