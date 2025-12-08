@@ -55,7 +55,7 @@ def load_and_process_data():
         'Volume': 'VOLUME'
     })
     
-    # Select only needed columns (avoids any extra)
+    # Select only needed columns
     df = df[['DATE', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']]
     df['DATE'] = pd.to_datetime(df['DATE'])
     df = df.sort_values("DATE").reset_index(drop=True)
@@ -174,7 +174,7 @@ if "BUY" in signal:
           → [CBOE](https://www.cboe.com/tradable-products/vix/vix-options)
         """)
 
-# Interactive Plotly Chart
+# Interactive Plotly Chart - LIGHT THEME FOR BETTER READABILITY
 fig = go.Figure()
 
 fig.add_trace(go.Scatter(x=df["DATE"], y=df["CLOSE"], mode='lines', name='VIX Close', line=dict(color='black')))
@@ -193,7 +193,17 @@ fig.add_hline(y=qs[0.75], line_dash="dash", line_color="red", annotation_text="S
 fig.add_hline(y=mean_vix, line_dash="dot", line_color="blue", annotation_text="Long-term Mean")
 fig.add_hline(y=mean_vix*0.95, line_dash="dashdot", line_color="purple", annotation_text="95% Mean Trigger")
 
-fig.update_layout(title="Interactive VIX with Signals", height=600, hovermode="x unified")
+# Force light theme for readability (white background, black grid)
+fig.update_layout(
+    title="Interactive VIX with Signals",
+    height=600,
+    hovermode="x unified",
+    template="plotly_white",  # Light background
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font=dict(color="black")
+)
+
 st.plotly_chart(fig, use_container_width=True)
 
 # Historical stats
