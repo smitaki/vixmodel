@@ -7,7 +7,27 @@ import plotly.graph_objects as go
 from datetime import datetime
 from sklearn.cluster import KMeans
 
+# Force light mode for the entire app
 st.set_page_config(page_title="VIX Spike Predictor", layout="wide")
+
+# Custom CSS to enforce light theme globally
+st.markdown("""
+<style>
+    .reportview-container {
+        background: #ffffff;
+        color: #000000;
+    }
+    .sidebar .sidebar-content {
+        background: #f0f2f6;
+    }
+    .css-1d391kg {
+        background: #ffffff;
+    }
+    h1, h2, h3, h4, h5, h6, p, div, span, label {
+        color: #000000 !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ----------------------------------------------------
 # CONFIG
@@ -121,7 +141,7 @@ def load_and_process_data():
     return df
 
 # ----------------------------------------------------
-# STREAMLIT APP
+# STREAMLIT APP - FULL LIGHT MODE
 # ----------------------------------------------------
 st.title("🛡️ VIX Spike Predictor Dashboard")
 st.markdown("Real-time VIX analysis with historical analogs and call-buying signals")
@@ -148,14 +168,14 @@ if df is None:
 latest = df.iloc[-1]
 mean_vix = df["CLOSE"].mean()
 
-# Metrics - larger and colored
+# Metrics
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("VIX Close", f"{latest['CLOSE']:.2f}", f"{latest['daily_return']:.2%}")
 c2.metric("Regime", latest["regime"].capitalize())
 c3.metric("Rolling Vol", f"{latest['rolling_vol_30d']:.2f}")
 c4.metric("Long-term Mean", f"{mean_vix:.2f}")
 
-# Signal - bold and colored
+# Signal with color
 signal = latest["signal"]
 reason = latest.get("signal_reason", "Monitoring")
 
@@ -185,7 +205,7 @@ if "BUY" in signal:
           → [CBOE](https://www.cboe.com/tradable-products/vix/vix-options)
         """)
 
-# Interactive Plotly Chart - VISUALLY ENHANCED
+# Interactive Plotly Chart - FULL LIGHT MODE & ENHANCED VISUALS
 fig = go.Figure()
 
 fig.add_trace(go.Scatter(x=df["DATE"], y=df["CLOSE"], mode='lines', name='VIX Close', line=dict(color='black', width=2)))
@@ -226,7 +246,8 @@ fig.update_layout(
 fig.update_yaxes(gridcolor="lightgray", zerolinecolor="gray")
 fig.update_xaxes(gridcolor="lightgray")
 
-st.plotly_chart(fig, use_container_width=True)
+# Force light theme in Streamlit chart display
+st.plotly_chart(fig, use_container_width=True, theme=None)
 
 # Historical stats
 with st.expander("Historical & Seasonal Stats"):
