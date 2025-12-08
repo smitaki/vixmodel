@@ -6,19 +6,20 @@ import yfinance as yf
 import plotly.graph_objects as go
 from datetime import datetime
 from sklearn.cluster import KMeans
+import ta  # Add for RSI; pip install ta-lib or ta
 
 st.set_page_config(page_title="VIX Spike Predictor", layout="wide")
 
-# FULL LIGHT MODE CSS OVERRIDE
+# FULL LIGHT MODE CSS
 st.markdown("""
 <style>
     /* Main app background and text */
     .stApp {
-        background-color: white !important;
-        color: black !important;
+        background-color: #ffffff !important;
+        color: #000000 !important;
     }
     .css-1d391kg, .css-18e3th9, .css-fblp2m {
-        background-color: white !important;
+        background-color: #ffffff !important;
     }
     /* Sidebar */
     section[data-testid="stSidebar"] {
@@ -26,7 +27,7 @@ st.markdown("""
     }
     /* Text and headers */
     h1, h2, h3, h4, h5, h6, p, div, span, label, .stMarkdown {
-        color: black !important;
+        color: #000000 !important;
     }
     /* Metrics and buttons */
     .css-1xarl3l, .css-1offfwp, .css-1v0mbdj {
@@ -59,7 +60,7 @@ ANALOG_VOL_TOL = 0.10
 DAILY_SPIKE_THRESH = 0.10
 
 # ----------------------------------------------------
-# DATA & FEATURES
+# DATA & FEATURES - ADDED RSI FOR MATURITY
 # ----------------------------------------------------
 @st.cache_data(ttl=60)  # Refresh cache every 60s
 def load_and_process_data():
@@ -94,6 +95,9 @@ def load_and_process_data():
     df["daily_return"] = df["CLOSE"].pct_change()
     df["rolling_vol_30d"] = df["daily_return"].rolling(ROLLING_WINDOW).std() * np.sqrt(252)
     
+    # NEW: RSI for oversold/overbought (mature math layer)
+    df["rsi_14"] = ta.momentum.RSIIndicator(df["CLOSE"], window=14).rsi()
+    
     regime_labels = ["calm", "normal", "elevated", "stressed"]
     df["regime"] = pd.qcut(df["CLOSE"], q=4, labels=regime_labels)
     
@@ -114,7 +118,7 @@ def load_and_process_data():
         cluster_map = {order[i]: labels[i] for i in range(3)}
         df.loc[mask, "spike_cluster"] = pd.Series(kmeans.labels_, index=df.loc[mask].index).map(cluster_map)
     
-    # Signals with analogs
+    # Signals with analogs - ADDED RSI FILTER FOR COMPLEXITY
     df["signal"] = "HOLD"
     df["signal_reason"] = ""
     
@@ -123,23 +127,24 @@ def load_and_process_data():
         mean_vix = df["CLOSE"].mean()
         est_days = SEASONAL_DAYS_TO_SPIKE.get(latest["DATE"].month, 28)
         
-        # Historical analogs
+        # Historical analogs - MATURED: SEASON FILTER
         hist = df.iloc[:-1]
         level_mask = abs((hist["CLOSE"] - latest["CLOSE"]) / latest["CLOSE"]) <= ANALOG_LEVEL_TOL
         vol_mask = abs((hist["rolling_vol_30d"] - latest["rolling_vol_30d"]) / latest["rolling_vol_30d"]) <= ANALOG_VOL_TOL
         regime_mask = hist["regime"] == latest["regime"]
-        analogs = hist[level_mask & vol_mask & regime_mask]
+        season_mask = hist["DATE"].dt.month == latest["DATE"].month  # Same month for seasonal maturity
+        analogs = hist[level_mask & vol_mask & regime_mask & season_mask]
         prob_spike = (analogs["fwd_1d_vix_chg"] >= DAILY_SPIKE_THRESH).mean() if len(analogs) > 0 else np.nan
         
-        if (latest["regime"] == "calm") and (latest["CLOSE"] < mean_vix * 0.95):
+        if (latest["regime"] == "calm") and (latest["CLOSE"] < mean_vix * 0.95) and (latest["rsi_14"] < 30):  # RSI filter
             signal = "STRONG_BUY_VIX_CALLS" if prob_spike > 0.5 else "BUY_VIX_CALLS"
-            reason = f"Calm regime + low level. Analogs: {len(analogs)}, prob spike: {prob_spike:.1%}" if not np.isnan(prob_spike) else "Strong complacency"
+            reason = f"Calm regime + low level + oversold RSI. Season analogs: {len(analogs)}, prob spike: {prob_spike:.1%}" if not np.isnan(prob_spike) else "Strong complacency"
             df.at[df.index[-1], "signal"] = signal
             df.at[df.index[-1], "signal_reason"] = reason + f" | ~{est_days} days to spike"
         
-        elif (latest["regime"] in ["calm", "normal"]) and (latest["rolling_vol_30d"] < df["rolling_vol_30d"].quantile(0.4)):
+        elif (latest["regime"] in ["calm", "normal"]) and (latest["rolling_vol_30d"] < df["rolling_vol_30d"].quantile(0.4)) and (latest["rsi_14"] < 30):
             signal = "STRONG_BUY_VIX_CALLS" if prob_spike > 0.5 else "BUY_VIX_CALLS"
-            reason = f"Low vol setup. Analogs: {len(analogs)}, prob spike: {prob_spike:.1%}" if not np.isnan(prob_spike) else "Complacency building"
+            reason = f"Low vol setup + oversold RSI. Season analogs: {len(analogs)}, prob spike: {prob_spike:.1%}" if not np.isnan(prob_spike) else "Complacency building"
             df.at[df.index[-1], "signal"] = signal
             df.at[df.index[-1], "signal_reason"] = reason + f" | ~{est_days} days"
         
@@ -178,28 +183,17 @@ if df is None:
 latest = df.iloc[-1]
 mean_vix = df["CLOSE"].mean()
 
-# Metrics - larger and colored
+# Metrics
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("VIX Close", f"{latest['CLOSE']:.2f}", f"{latest['daily_return']:.2%}")
 c2.metric("Regime", latest["regime"].capitalize())
 c3.metric("Rolling Vol", f"{latest['rolling_vol_30d']:.2f}")
 c4.metric("Long-term Mean", f"{mean_vix:.2f}")
 
-# Signal - bold and colored
+# Signal
 signal = latest["signal"]
 reason = latest.get("signal_reason", "Monitoring")
-
-if "STRONG_BUY" in signal:
-    st.success(f"### **SIGNAL: {signal.replace('_', ' ')}**")
-elif "BUY" in signal:
-    st.success(f"### **SIGNAL: {signal.replace('_', ' ')}**")
-elif "STRONG_SELL" in signal:
-    st.error(f"### **SIGNAL: {signal.replace('_', ' ')}**")
-elif "SELL" in signal:
-    st.warning(f"### **SIGNAL: {signal.replace('_', ' ')}**")
-else:
-    st.info(f"### **SIGNAL: {signal.replace('_', ' ')}**")
-
+st.markdown(f"### **SIGNAL: {signal.replace('_', ' ')}**")
 st.markdown(f"**Reason:** {reason}")
 st.markdown(f"**Seasonal Outlook:** ~{SEASONAL_DAYS_TO_SPIKE.get(latest['DATE'].month, 28)} days to potential spike")
 
@@ -215,17 +209,15 @@ if "BUY" in signal:
           → [CBOE](https://www.cboe.com/tradable-products/vix/vix-options)
         """)
 
-# Interactive Plotly Chart - VISUALLY ENHANCED & LIGHT MODE
+# Interactive Plotly Chart
 fig = go.Figure()
-
-fig.add_trace(go.Scatter(x=df["DATE"], y=df["CLOSE"], mode='lines', name='VIX Close', line=dict(color='black', width=2)))
-
-buy = df[df["signal"].str.contains("BUY_VIX_CALLS", na=False)]
-sell = df[df["signal"].str.contains("SELL_VIX", na=False)]
+fig.add_trace(go.Scatter(x=df["DATE"], y=df["CLOSE"], mode='lines', name='VIX Close', line=dict(color='black')))
+buy = df[df["signal"].str.contains("BUY_VIX_CALLS")]
+sell = df[df["signal"].str.contains("SELL_VIX")]
 fig.add_trace(go.Scatter(x=buy["DATE"], y=buy["CLOSE"], mode='markers', name='BUY VIX CALLS',
-                         marker=dict(symbol='triangle-up', size=14, color='green', line=dict(width=2))))
+                         marker=dict(symbol='triangle-up', size=12, color='green')))
 fig.add_trace(go.Scatter(x=sell["DATE"], y=sell["CLOSE"], mode='markers', name='SELL VIX',
-                         marker=dict(symbol='triangle-down', size=14, color='red', line=dict(width=2))))
+                         marker=dict(symbol='triangle-down', size=12, color='red')))
 
 qs = df["CLOSE"].quantile([0.25, 0.5, 0.75])
 fig.add_hline(y=qs[0.25], line_dash="dash", line_color="green", annotation_text="Calm Threshold")
@@ -234,29 +226,8 @@ fig.add_hline(y=qs[0.75], line_dash="dash", line_color="red", annotation_text="S
 fig.add_hline(y=mean_vix, line_dash="dot", line_color="blue", annotation_text="Long-term Mean")
 fig.add_hline(y=mean_vix*0.95, line_dash="dashdot", line_color="purple", annotation_text="95% Mean Trigger")
 
-fig.update_layout(
-    title="Interactive VIX with Signals",
-    height=700,
-    hovermode="x unified",
-    template="plotly_white",
-    plot_bgcolor="white",
-    paper_bgcolor="white",
-    font=dict(color="black", size=12),
-    legend=dict(
-        orientation="h",
-        yanchor="bottom", y=1.02,
-        xanchor="left", x=0,
-        bgcolor="rgba(255,255,255,0.9)",
-        bordercolor="gray",
-        borderwidth=1
-    ),
-    margin=dict(l=50, r=50, t=100, b=50)
-)
-
-fig.update_yaxes(gridcolor="lightgray", zerolinecolor="gray")
-fig.update_xaxes(gridcolor="lightgray")
-
-st.plotly_chart(fig, use_container_width=True, theme=None)  # theme=None ensures light chart
+fig.update_layout(title="Interactive VIX with Signals", height=600, hovermode="x unified")
+st.plotly_chart(fig, use_container_width=True)
 
 # Historical stats
 with st.expander("Historical & Seasonal Stats"):
@@ -271,6 +242,4 @@ with st.expander("Historical & Seasonal Stats"):
         st.write("**Seasonal Days to Spike**")
         for m in range(1, 13):
             st.write(f"{datetime(2025, m, 1).strftime('%B')}: ~{SEASONAL_DAYS_TO_SPIKE[m]} days")
-
-st.divider()
 st.caption("Math-based VIX spike predictor | Not financial advice")
