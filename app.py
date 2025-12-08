@@ -39,10 +39,28 @@ def load_and_process_data():
         st.error("Failed to load VIX data.")
         return None
     
-    df = data.reset_index()
-    df = df.rename(columns={'Date': 'DATE', 'Close': 'CLOSE'})
-    df['DATE'] = pd.to_datetime(df['DATE'])
+    # FIX: Handle potential MultiIndex columns
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
     
+    df = data.reset_index()
+    
+    # Robust renaming and selection
+    df = df.rename(columns={
+        'Date': 'DATE',
+        'Open': 'OPEN',
+        'High': 'HIGH',
+        'Low': 'LOW',
+        'Close': 'CLOSE',
+        'Volume': 'VOLUME'
+    })
+    
+    # Select only needed columns (avoids any extra)
+    df = df[['DATE', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']]
+    df['DATE'] = pd.to_datetime(df['DATE'])
+    df = df.sort_values("DATE").reset_index(drop=True)
+    
+    # Features
     df["daily_return"] = df["CLOSE"].pct_change()
     df["rolling_vol_30d"] = df["daily_return"].rolling(ROLLING_WINDOW).std() * np.sqrt(252)
     
@@ -140,9 +158,6 @@ c4.metric("Long-term Mean", f"{mean_vix:.2f}")
 # Signal
 signal = latest["signal"]
 reason = latest.get("signal_reason", "Monitoring")
-color = {"STRONG_BUY_VIX_CALLS": "green", "BUY_VIX_CALLS": "lightgreen",
-         "STRONG_SELL_VIX": "red", "SELL_VIX": "lightred"}.get(signal, "gray")
-
 st.markdown(f"### **SIGNAL: {signal.replace('_', ' ')}**")
 st.markdown(f"**Reason:** {reason}")
 st.markdown(f"**Seasonal Outlook:** ~{SEASONAL_DAYS_TO_SPIKE.get(latest['DATE'].month, 28)} days to potential spike")
@@ -164,8 +179,8 @@ fig = go.Figure()
 
 fig.add_trace(go.Scatter(x=df["DATE"], y=df["CLOSE"], mode='lines', name='VIX Close', line=dict(color='black')))
 
-buy = df[df["signal"].str.contains("BUY_VIX_CALLS")]
-sell = df[df["signal"].str.contains("SELL_VIX")]
+buy = df[df["signal"].str.contains("BUY_VIX_CALLS", na=False)]
+sell = df[df["signal"].str.contains("SELL_VIX", na=False)]
 fig.add_trace(go.Scatter(x=buy["DATE"], y=buy["CLOSE"], mode='markers', name='BUY VIX CALLS',
                          marker=dict(symbol='triangle-up', size=12, color='green')))
 fig.add_trace(go.Scatter(x=sell["DATE"], y=sell["CLOSE"], mode='markers', name='SELL VIX',
