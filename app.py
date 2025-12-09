@@ -16,7 +16,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for "Pro" look
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
@@ -29,12 +28,12 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. DATA LOADING & MODELING
+# 2. DATA LOADING & MODELING (DYNAMIC INPUTS)
 # -----------------------------------------------------------------------------
 START_DATE = "2007-01-01" 
 
 @st.cache_data(ttl=60)
-def load_and_process_data():
+def load_and_process_data(lookback_days=20, fear_mult=1.0):
     tickers = ["^VIX", "^GSPC", "^VVIX"]
     data = yf.download(tickers, start=START_DATE, progress=False)
     
@@ -48,21 +47,24 @@ def load_and_process_data():
     df['VVIX'] = df['VVIX'].ffill() 
     df.dropna(inplace=True)
 
-    # --- Indicators ---
+    # --- Indicators (Using Lookback Input) ---
     df["daily_return"] = df["CLOSE"].pct_change()
-    df["rolling_mean_20d"] = df["CLOSE"].rolling(20).mean()
-    df["rolling_std_20d"] = df["CLOSE"].rolling(20).std()
     
-    df['bollinger_upper'] = df['rolling_mean_20d'] + (2 * df['rolling_std_20d'])
-    df['bollinger_lower'] = df['rolling_mean_20d'] - (2 * df['rolling_std_20d'])
-    df['bb_width'] = (df['bollinger_upper'] - df['bollinger_lower']) / df['rolling_mean_20d']
+    # Dynamic Rolling Window based on user input
+    df["rolling_mean"] = df["CLOSE"].rolling(lookback_days).mean()
+    df["rolling_std"] = df["CLOSE"].rolling(lookback_days).std()
     
+    df['bollinger_upper'] = df['rolling_mean'] + (2 * df['rolling_std'])
+    df['bollinger_lower'] = df['rolling_mean'] - (2 * df['rolling_std'])
+    df['bb_width'] = (df['bollinger_upper'] - df['bollinger_lower']) / df['rolling_mean']
+    
+    # Momentum
     delta = df['CLOSE'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
-    df['z_score'] = (df['CLOSE'] - df['rolling_mean_20d']) / df['rolling_std_20d']
+    df['z_score'] = (df['CLOSE'] - df['rolling_mean']) / df['rolling_std']
     
     # Context
     df['spx_ma50'] = df['SPX'].rolling(50).mean()
@@ -70,15 +72,13 @@ def load_and_process_data():
     df['vvix_ma10'] = df['VVIX'].rolling(10).mean()
     df["regime"] = pd.qcut(df["CLOSE"], q=4, labels=["calm", "normal", "elevated", "stressed"])
 
-    # --- VPE Index (Energy) ---
-    # Formula: VVIX / (Width * Price)
+    # --- VPE Index (Energy) WITH FEAR MULTIPLIER ---
+    # Formula: (VVIX * Sensitivity) / (Width * Price)
     epsilon = 1e-6
-    df['vpe_raw'] = df['VVIX'] / ((df['bb_width'] * df['CLOSE']) + epsilon)
-    # Normalize 0-100 based on 1-year history
+    df['vpe_raw'] = (df['VVIX'] * fear_mult) / ((df['bb_width'] * df['CLOSE']) + epsilon)
     df['VPE'] = df['vpe_raw'].rolling(252).rank(pct=True) * 100
 
     # --- AI Learning (Walk-Forward Optimization) ---
-    # Finds the best squeeze threshold based on last 1 year of data
     potential_thresholds = [0.05, 0.10, 0.15] 
     best_thresh = 0.10 
     best_score = -1
@@ -86,7 +86,7 @@ def load_and_process_data():
     
     for thresh in potential_thresholds:
         squeeze_level = training_data['bb_width'].quantile(thresh)
-        signals = (training_data['bb_width'] < squeeze_level) & (training_data['CLOSE'] <= training_data['rolling_mean_20d'])
+        signals = (training_data['bb_width'] < squeeze_level) & (training_data['CLOSE'] <= training_data['rolling_mean'])
         hits = 0
         signal_indices = training_data[signals].index
         for idx in signal_indices:
@@ -102,62 +102,58 @@ def load_and_process_data():
     stats = {'learned_threshold': best_thresh}
     return df, stats
 
-# --- Signal Generator (Dynamic with Confidence) ---
+# --- Signal Generator ---
 def apply_signals(df, squeeze_threshold):
     df['chart_signal'] = "HOLD"
-    df['confidence'] = 0.0 # Initialize confidence score (0-100)
+    df['confidence'] = 0.0
     
     learned_sqz_val = df['bb_width'].quantile(squeeze_threshold)
     
-    # 1. Squeeze Buy (Standard)
-    cond_sqz = (df['bb_width'] < learned_sqz_val) & (df['CLOSE'] <= df['rolling_mean_20d'])
+    cond_sqz = (df['bb_width'] < learned_sqz_val) & (df['CLOSE'] <= df['rolling_mean'])
     cond_spx = (df['spx_trend'] == "UPTREND") & (df['VVIX'] < df['VVIX'].rolling(50).mean())
     cond_sqz_final = cond_sqz & (~cond_spx)
     
-    # 2. VPE Signals (Master Energy)
-    # BUY: High Potential Energy (>90)
     cond_vpe_buy = df['VPE'] > 90
-    # SELL: Energy Dissipated (<10)
     cond_vpe_sell = df['VPE'] < 10
     
-    # 3. Standard Value/Extreme Sell
     cond_val = (df['z_score'] < -1.5) & (df['regime'].isin(['calm', 'normal']))
     cond_sell_ext = (df['z_score'] > 2.0) | (df['rsi'] > 75)
     
-    # --- Apply Signals & Calculate Confidence ---
-    
-    # A. Value Buy
-    # Confidence: How far below -1.5 Z-score? (Max confidence at -3.0)
+    # Apply & Score
     df.loc[cond_val, 'chart_signal'] = 'BUY_VALUE'
     df.loc[cond_val, 'confidence'] = ((df.loc[cond_val, 'z_score'].abs() - 1.5) / 1.5).clip(0, 1) * 100
     
-    # B. Squeeze Buy
-    # Confidence: How tight is it compared to the threshold? 
-    # If Thresh is 0.10 and Width is 0.01, Confidence is high.
-    df.loc[cond_sqz_final, 'chart_signal'] = 'BUY_SQUEEZE'
-    # Avoid div/0 by using epsilon if learned_sqz_val is 0
     safe_thresh = learned_sqz_val if learned_sqz_val > 0 else 0.001
+    df.loc[cond_sqz_final, 'chart_signal'] = 'BUY_SQUEEZE'
     df.loc[cond_sqz_final, 'confidence'] = ((safe_thresh - df.loc[cond_sqz_final, 'bb_width']) / safe_thresh).clip(0, 1) * 100
     
-    # C. VPE Buy (Master) - Replaces Squeeze if valid
-    # Confidence: (VPE - 90) / 10 -> Scales 90-100 to 0-100%
     df.loc[cond_vpe_buy, 'chart_signal'] = 'BUY_VPE'      
     df.loc[cond_vpe_buy, 'confidence'] = ((df.loc[cond_vpe_buy, 'VPE'] - 90) / 10).clip(0, 1) * 100
     
-    # D. Sells
     df.loc[cond_vpe_sell, 'chart_signal'] = 'SELL_VPE'    
     df.loc[cond_vpe_sell, 'confidence'] = ((10 - df.loc[cond_vpe_sell, 'VPE']) / 10).clip(0, 1) * 100
     
     df.loc[cond_sell_ext, 'chart_signal'] = 'SELL_EXTREME'
-    df.loc[cond_sell_ext, 'confidence'] = 100 # Extreme statistical deviation is high conviction
+    df.loc[cond_sell_ext, 'confidence'] = 100
     
     return df
 
-# --- Forecast Engine ---
-def generate_forecast(data, days_ahead=21, num_sims=1000):
+# --- Forecast Engine (Regime Override) ---
+def generate_forecast(data, days_ahead=21, num_sims=1000, regime_mode="Auto-Detect"):
     curr_vix = data['CLOSE'].iloc[-1]
-    curr_regime = data['regime'].iloc[-1]
-    regime_data = data[data['regime'] == curr_regime]
+    
+    # LOGIC: Filter historical data based on User Input
+    if "Force Calm" in regime_mode:
+        regime_data = data[data['CLOSE'] < 15]
+    elif "Force Stressed" in regime_mode:
+        regime_data = data[data['CLOSE'] > 25]
+    elif "Force Crisis" in regime_mode:
+        regime_data = data[data['CLOSE'] > 40]
+    else:
+        # Auto-Detect (Default)
+        curr_regime = data['regime'].iloc[-1]
+        regime_data = data[data['regime'] == curr_regime]
+
     daily_changes = regime_data['CLOSE'].diff().dropna()
     if len(daily_changes) < 10: daily_changes = data['CLOSE'].diff().dropna()
 
@@ -166,7 +162,6 @@ def generate_forecast(data, days_ahead=21, num_sims=1000):
         path = [curr_vix]
         shocks = np.random.choice(daily_changes, days_ahead)
         for s in shocks:
-            # Mean reverting drift + random shock
             path.append(max(9, path[-1] + (0.05 * (19.5 - path[-1])) + s))
         sim_res[:, i] = path[1:]
         
@@ -178,74 +173,92 @@ def generate_forecast(data, days_ahead=21, num_sims=1000):
         'Lower': np.percentile(sim_res, 10, axis=1)
     })
 
-# Load Initial Data
-raw_df, ai_stats = load_and_process_data()
-
 # -----------------------------------------------------------------------------
-# 3. SIDEBAR & CONTROLS
+# 3. SIDEBAR (CONTROLS)
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("🎛️ Control Panel")
     
-    # Date Range
-    min_d, max_d = raw_df['DATE'].min().date(), raw_df['DATE'].max().date()
-    def_start = max(min_d, pd.to_datetime("2023-01-01").date())
-    date_range = st.slider("Timeline", min_d, max_d, (def_start, max_d))
+    # 1. Timeline (Existing)
+    # We load minimal data first just to get min/max dates for slider
+    # (In production you might optimize this, here we just hardcode defaults for speed)
+    default_date = pd.to_datetime("2023-01-01").date()
+    today = datetime.now().date()
+    date_range = st.slider("Timeline", pd.to_datetime("2020-01-01").date(), today, (default_date, today))
     
     st.markdown("---")
-    st.subheader("⚙️ Model Sensitivity")
     
-    # Override Mode
-    mode = st.radio("Threshold Strategy", ["AI Auto-Pilot", "Manual Override"], index=0)
+    # 2. SCENARIO LAB (NEW INPUTS)
+    st.subheader("🧪 Scenario Lab")
     
-    if mode == "AI Auto-Pilot":
-        active_thresh = ai_stats['learned_threshold']
-        st.info(f"🤖 AI Selected: {active_thresh*100:.0f}% Percentile")
-    else:
-        active_thresh = st.slider("Manual Squeeze %", 0.01, 0.20, 0.10, 0.01)
+    # Input A: Regime Override
+    regime_override = st.selectbox(
+        "Forecast Mode", 
+        ["Auto-Detect", "Force Calm (<15)", "Force Stressed (>25)", "Force Crisis (>40)"],
+        help="Simulate how the forecast looks if we were in a different market regime."
+    )
+    
+    # Input B: Lookback Window
+    lookback = st.slider(
+        "Trend Baseline (Days)", 
+        10, 50, 20, 
+        help="Lower = Faster signals (Scalping). Higher = Slower signals (Investing)."
+    )
+    
+    # Input C: Fear Sensitivity
+    fear_mult = st.slider(
+        "Fear Sensitivity", 
+        0.5, 2.0, 1.0, 0.1, 
+        help="Multiplies VVIX impact. Increase to catch early/weak signals."
+    )
     
     st.markdown("---")
-    st.subheader("👀 Visual Aids")
-    show_forecast = st.toggle("Show Future Forecast", value=True)
-    show_backtest = st.toggle("Show Backtest Results", value=False, help="Colors background Green/Red if signal succeeded.")
 
-# Apply Filters & Signals
+    # 3. Model Sensitivity (Existing)
+    st.subheader("⚙️ Model Settings")
+    mode = st.radio("Threshold Strategy", ["AI Auto-Pilot", "Manual Override"], index=0)
+    manual_thresh = 0.10
+    if mode == "Manual Override":
+        manual_thresh = st.slider("Manual Squeeze %", 0.01, 0.20, 0.10, 0.01)
+    
+    st.markdown("---")
+    
+    # 4. Visual Aids
+    st.subheader("👀 Visuals")
+    show_forecast = st.toggle("Show Forecast", value=True)
+    show_backtest = st.toggle("Show Backtest", value=False)
+
+# -----------------------------------------------------------------------------
+# 4. EXECUTION & DASHBOARD
+# -----------------------------------------------------------------------------
+# Load Data with User Inputs
+raw_df, ai_stats = load_and_process_data(lookback_days=lookback, fear_mult=fear_mult)
+
+if raw_df is None:
+    st.stop()
+
+# Determine active threshold
+active_thresh = ai_stats['learned_threshold'] if mode == "AI Auto-Pilot" else manual_thresh
+
+# Apply Logic
 df = apply_signals(raw_df.copy(), active_thresh)
 mask = (df['DATE'].dt.date >= date_range[0]) & (df['DATE'].dt.date <= date_range[1])
 df_filtered = df.loc[mask]
 
-# Stats Calculation (Latency)
-buy_idx = df[df['chart_signal'].str.contains("BUY")].index
-latencies = []
-for idx in buy_idx[-50:]: 
-    if idx+30 < len(df):
-        fw = df.iloc[idx+1:idx+30]
-        if not fw[fw['daily_return'] > 0.10].empty:
-            latencies.append(fw[fw['daily_return'] > 0.10].index[0] - idx)
-med_latency = np.median(latencies) if latencies else 5
-
-# -----------------------------------------------------------------------------
-# 4. DASHBOARD HEADER
-# -----------------------------------------------------------------------------
+# Dashboard Header
 st.title("🛡️ VIX Spike Predictor Pro")
 st.caption("AI-Driven Volatility Intelligence System")
 
-# Status Bar
 last = df.iloc[-1]
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("VIX Level", f"{last['CLOSE']:.2f}", f"{last['CLOSE'] - df.iloc[-2]['CLOSE']:.2f}")
 c2.metric("Regime", str(last['regime']).upper(), delta_color="off")
 c3.metric("VPE Index", f"{last['VPE']:.0f}/100", "Energy")
 c4.metric("VVIX Level", f"{last['VVIX']:.2f}")
-
 sig_icon = "🟢" if "BUY" in last['chart_signal'] else "🔴" if "SELL" in last['chart_signal'] else "⚪"
 c5.metric("Model Signal", last['chart_signal'].replace("_", " "), sig_icon)
 
-# -----------------------------------------------------------------------------
-# 5. CHARTS
-# -----------------------------------------------------------------------------
-
-# --- CHART 1: MAIN PRICE & SIGNALS ---
+# Charts
 with st.expander("ℹ️ How to read the Price & Signal Chart"):
     st.markdown("""
     * **Purple Diamonds (VPE Buy):** Critical Energy (>90). The spring is coiled tight. Spike imminent.
@@ -260,90 +273,53 @@ fig = make_subplots(
     subplot_titles=("VIX Price Action", "Z-Score", "Bollinger Width", "VPE Index (Energy)")
 )
 
-# Price
+# 1. Price
 fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['CLOSE'], mode='lines', line=dict(color='#00d4ff', width=2), name='VIX'), row=1, col=1)
 
-# Backtest Overlay
 if show_backtest:
     for idx, row in df_filtered.iterrows():
         if "BUY" in row['chart_signal']:
             future = df[df['DATE'] > row['DATE']].head(10)
-            if not future.empty and future['daily_return'].max() > 0.10:
-                color = "rgba(0, 255, 0, 0.1)" # Green Success
-            else:
-                color = "rgba(255, 0, 0, 0.1)" # Red Fail
+            color = "rgba(0, 255, 0, 0.1)" if (not future.empty and future['daily_return'].max() > 0.10) else "rgba(255, 0, 0, 0.1)"
             fig.add_vrect(x0=row['DATE'], x1=row['DATE'] + timedelta(days=5), fillcolor=color, layer="below", line_width=0, row=1, col=1)
 
-# Forecast
 if show_forecast:
-    f_df = generate_forecast(df, 21)
+    # Pass the REGIME OVERRIDE to the forecast engine
+    f_df = generate_forecast(df, 21, regime_mode=regime_override)
     x = list(f_df['DATE']) + list(f_df['DATE'])[::-1]
     y = list(f_df['Upper']) + list(f_df['Lower'])[::-1]
     fig.add_trace(go.Scatter(x=x, y=y, fill='toself', fillcolor='rgba(0,229,255,0.1)', line=dict(width=0), name='Forecast'), row=1, col=1)
     fig.add_trace(go.Scatter(x=f_df['DATE'], y=f_df['Forecast'], line=dict(dash='dash', color='yellow'), name='Median'), row=1, col=1)
 
 # Markers
-sigs = {
-    'BUY_VPE': ('diamond', '#d500f9', 12),      # New VPE Buy (Purple)
-    'BUY_SQUEEZE': ('star', 'orange', 14),      # Classic Squeeze
-    'SELL_VPE': ('cross', 'gray', 10),          # New VPE Sell (Grey)
-    'SELL_EXTREME': ('triangle-down', 'red', 10),
-    'BUY_VALUE': ('triangle-up', '#00ff00', 10)
-}
+sigs = {'BUY_VPE': ('diamond', '#d500f9', 12), 'BUY_SQUEEZE': ('star', 'orange', 14), 
+        'SELL_VPE': ('cross', 'gray', 10), 'SELL_EXTREME': ('triangle-down', 'red', 10), 'BUY_VALUE': ('triangle-up', '#00ff00', 10)}
 
 for key, (sym, col, size) in sigs.items():
     d = df_filtered[df_filtered['chart_signal'] == key]
     fig.add_trace(go.Scatter(x=d['DATE'], y=d['CLOSE'], mode='markers', marker=dict(symbol=sym, size=size, color=col, line=dict(width=1, color='white')), name=key), row=1, col=1)
 
-# --- CHART 2: Z-SCORE ---
+# 2. Z-Score
 colors = np.where(df_filtered['z_score'] > 2, 'red', np.where(df_filtered['z_score'] < -1.5, 'green', 'gray'))
 fig.add_trace(go.Bar(x=df_filtered['DATE'], y=df_filtered['z_score'], marker_color=colors, name='Z-Score'), row=2, col=1)
 fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=2, col=1)
 
-# --- CHART 3: SQUEEZE ---
+# 3. Squeeze
 fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['bb_width'], line=dict(color='yellow', width=1), name='BB Width'), row=3, col=1)
-fig.add_hline(y=df['bb_width'].quantile(active_thresh), line_dash="dot", line_color="orange", annotation_text=f"Trigger: {active_thresh*100:.0f}%", row=3, col=1)
+fig.add_hline(y=df['bb_width'].quantile(active_thresh), line_dash="dot", line_color="orange", row=3, col=1)
 
-# --- CHART 4: VPE INDEX ---
+# 4. VPE
 fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['VPE'], fill='tozeroy', line=dict(color='#d500f9', width=2), name='VPE'), row=4, col=1)
-fig.add_hline(y=90, line_dash="dot", line_color="red", annotation_text="Critcial (>90)", row=4, col=1)
-fig.add_hline(y=10, line_dash="dot", line_color="gray", annotation_text="Dormant (<10)", row=4, col=1)
+fig.add_hline(y=90, line_dash="dot", line_color="red", row=4, col=1)
+fig.add_hline(y=10, line_dash="dot", line_color="gray", row=4, col=1)
 
 fig.update_layout(height=1000, template="plotly_dark", margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 6. EXPLANATION SECTION
-# -----------------------------------------------------------------------------
-with st.expander("⚡ Understanding the VPE (Potential Energy) Index"):
-    st.markdown("""
-    **Formula:** $VPE = \\frac{VVIX}{Width \\times Price}$
-    
-    * **BUY (>90):** The VPE signal triggers when Fear (VVIX) is high but Price/Width are suppressed. This is a "coiled spring."
-    * **SELL (<10):** The signal drops when the energy dissipates (Price spikes and Bands widen, or Fear drops to zero).
-    """)
-
-# -----------------------------------------------------------------------------
-# 7. LEDGER
-# -----------------------------------------------------------------------------
+# Ledger
 st.subheader("📋 Signal Ledger")
-# We filter to show only rows where a signal exists, or just show latest history
-ledger_cols = ['DATE', 'CLOSE', 'chart_signal', 'confidence', 'VPE', 'z_score']
 st.dataframe(
-    df_filtered[ledger_cols].sort_values('DATE', ascending=False), 
-    use_container_width=True, 
-    height=300,
-    hide_index=True,
-    column_config={
-        "DATE": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
-        "CLOSE": st.column_config.NumberColumn("VIX", format="%.2f"),
-        "confidence": st.column_config.ProgressColumn(
-            "Signal Confidence", 
-            min_value=0, 
-            max_value=100, 
-            format="%d%%"
-        ),
-        "VPE": st.column_config.NumberColumn("VPE Index", format="%.0f"),
-        "z_score": st.column_config.NumberColumn("Z-Score", format="%.2f"),
-    }
+    df_filtered[['DATE', 'CLOSE', 'chart_signal', 'confidence', 'VPE', 'z_score']].sort_values('DATE', ascending=False), 
+    use_container_width=True, height=300, hide_index=True,
+    column_config={"confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%d%%")}
 )
