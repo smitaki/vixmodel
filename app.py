@@ -71,12 +71,14 @@ def load_and_process_data():
     df["regime"] = pd.qcut(df["CLOSE"], q=4, labels=["calm", "normal", "elevated", "stressed"])
 
     # --- VPE Index (Energy) ---
+    # Formula: VVIX / (Width * Price)
     epsilon = 1e-6
     df['vpe_raw'] = df['VVIX'] / ((df['bb_width'] * df['CLOSE']) + epsilon)
-    # Normalize 0-100
+    # Normalize 0-100 based on 1-year history
     df['VPE'] = df['vpe_raw'].rolling(252).rank(pct=True) * 100
 
-    # --- AI Learning (Walk-Forward) ---
+    # --- AI Learning (Walk-Forward Optimization) ---
+    # Finds the best squeeze threshold based on last 1 year of data
     potential_thresholds = [0.05, 0.10, 0.15] 
     best_thresh = 0.10 
     best_score = -1
@@ -122,12 +124,12 @@ def apply_signals(df, squeeze_threshold):
     cond_val = (df['z_score'] < -1.5) & (df['regime'].isin(['calm', 'normal']))
     cond_sell_ext = (df['z_score'] > 2.0) | (df['rsi'] > 75)
     
-    # Apply Signals (Order matters: later overwrites earlier if conflict)
+    # Apply Signals (Later overwrites earlier)
     df.loc[cond_val, 'chart_signal'] = 'BUY_VALUE'
     df.loc[cond_sqz_final, 'chart_signal'] = 'BUY_SQUEEZE'
-    df.loc[cond_vpe_buy, 'chart_signal'] = 'BUY_VPE'      # Replaces Breakout
+    df.loc[cond_vpe_buy, 'chart_signal'] = 'BUY_VPE'      # Critical Energy (Replaces Breakout)
     
-    df.loc[cond_vpe_sell, 'chart_signal'] = 'SELL_VPE'    # New Sell Logic
+    df.loc[cond_vpe_sell, 'chart_signal'] = 'SELL_VPE'    # Energy Exhaustion
     df.loc[cond_sell_ext, 'chart_signal'] = 'SELL_EXTREME'
     
     return df
@@ -145,6 +147,7 @@ def generate_forecast(data, days_ahead=21, num_sims=1000):
         path = [curr_vix]
         shocks = np.random.choice(daily_changes, days_ahead)
         for s in shocks:
+            # Mean reverting drift + random shock
             path.append(max(9, path[-1] + (0.05 * (19.5 - path[-1])) + s))
         sim_res[:, i] = path[1:]
         
@@ -192,7 +195,7 @@ df = apply_signals(raw_df.copy(), active_thresh)
 mask = (df['DATE'].dt.date >= date_range[0]) & (df['DATE'].dt.date <= date_range[1])
 df_filtered = df.loc[mask]
 
-# Stats Calculation
+# Stats Calculation (Latency)
 buy_idx = df[df['chart_signal'].str.contains("BUY")].index
 latencies = []
 for idx in buy_idx[-50:]: 
@@ -216,11 +219,11 @@ c2.metric("Regime", str(last['regime']).upper(), delta_color="off")
 c3.metric("VPE Index", f"{last['VPE']:.0f}/100", "Energy")
 c4.metric("VVIX Level", f"{last['VVIX']:.2f}")
 
-sig_icon = "🟢" if "BUY" in last['signal'] else "🔴" if "SELL" in last['signal'] else "⚪"
+sig_icon = "🟢" if "BUY" in last['chart_signal'] else "🔴" if "SELL" in last['chart_signal'] else "⚪"
 c5.metric("Model Signal", last['chart_signal'].replace("_", " "), sig_icon)
 
 # -----------------------------------------------------------------------------
-# 5. CHARTS WITH "HOW TO READ" EXPANDERS
+# 5. CHARTS
 # -----------------------------------------------------------------------------
 
 # --- CHART 1: MAIN PRICE & SIGNALS ---
@@ -232,8 +235,11 @@ with st.expander("ℹ️ How to read the Price & Signal Chart"):
     * **Red Triangles (Sell Extreme):** Statistical Over-extension (Z-Score > 2).
     """)
 
-fig = make_subplots(rows=4, cols=1, shared_xaxes=True, row_heights=[0.5, 0.15, 0.15, 0.2], vertical_spacing=0.03,
-                    subplot_titles=("VIX Price Action", "Z-Score", "Bollinger Width", "VPE Index"))
+fig = make_subplots(
+    rows=4, cols=1, shared_xaxes=True, 
+    row_heights=[0.5, 0.15, 0.15, 0.2], vertical_spacing=0.03,
+    subplot_titles=("VIX Price Action", "Z-Score", "Bollinger Width", "VPE Index (Energy)")
+)
 
 # Price
 fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['CLOSE'], mode='lines', line=dict(color='#00d4ff', width=2), name='VIX'), row=1, col=1)
@@ -288,7 +294,7 @@ fig.update_layout(height=1000, template="plotly_dark", margin=dict(l=10, r=10, t
 st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 6. EXPLANATION SECTION (VPE)
+# 6. EXPLANATION SECTION
 # -----------------------------------------------------------------------------
 with st.expander("⚡ Understanding the VPE (Potential Energy) Index"):
     st.markdown("""
