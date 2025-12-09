@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -33,40 +32,8 @@ st.markdown("""
 # -----------------------------------------------------------------------------
 START_DATE = "2007-01-01" 
 
-@st.cache_data(ttl=3600) # Cache CNN data for 1 hour
-def get_cnn_fear_greed():
-    """
-    Fetches historical Fear & Greed Index directly from CNN's API.
-    """
-    url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        
-        # Parse Historical Data
-        history = data['fear_and_greed_historical']['data']
-        fng_df = pd.DataFrame(history)
-        
-        # Convert Timestamp (ms) to DateTime
-        fng_df['DATE'] = pd.to_datetime(fng_df['x'], unit='ms').dt.normalize()
-        fng_df = fng_df.rename(columns={'y': 'FNG'})
-        
-        # Aggregate duplicates
-        fng_df = fng_df.groupby('DATE')['FNG'].mean().reset_index()
-        return fng_df[['DATE', 'FNG']]
-        
-    except Exception as e:
-        print(f"Error fetching CNN data: {e}")
-        return pd.DataFrame(columns=['DATE', 'FNG'])
-
 @st.cache_data(ttl=60)
 def load_and_process_data(lookback_days=20, fear_mult=1.0):
-    # 1. Fetch Market Data
     tickers = ["^VIX", "^GSPC", "^VVIX"]
     data = yf.download(tickers, start=START_DATE, progress=False)
     
@@ -75,20 +42,12 @@ def load_and_process_data(lookback_days=20, fear_mult=1.0):
     # Clean Data
     close_df = data['Close'].copy() if isinstance(data.columns, pd.MultiIndex) else data['Close'].copy()
     df = close_df.reset_index().rename(columns={'Date': 'DATE', '^VIX': 'CLOSE', '^GSPC': 'SPX', '^VVIX': 'VVIX'})
-    df['DATE'] = pd.to_datetime(df['DATE']).dt.normalize()
+    df['DATE'] = pd.to_datetime(df['DATE'])
     df = df.sort_values("DATE").reset_index(drop=True)
     df['VVIX'] = df['VVIX'].ffill() 
     df.dropna(inplace=True)
 
-    # 2. Fetch & Merge CNN Fear & Greed
-    fng_df = get_cnn_fear_greed()
-    if not fng_df.empty:
-        df = pd.merge(df, fng_df, on='DATE', how='left')
-        df['FNG'] = df['FNG'].ffill()
-    else:
-        df['FNG'] = 50 # Default neutral
-
-    # 3. Indicators (Using Lookback Input)
+    # --- Indicators (Using Lookback Input) ---
     df["daily_return"] = df["CLOSE"].pct_change()
     
     # Dynamic Rolling Window based on user input
@@ -220,7 +179,9 @@ def generate_forecast(data, days_ahead=21, num_sims=1000, regime_mode="Auto-Dete
 with st.sidebar:
     st.header("🎛️ Control Panel")
     
-    # 1. Timeline
+    # 1. Timeline (Existing)
+    # We load minimal data first just to get min/max dates for slider
+    # (In production you might optimize this, here we just hardcode defaults for speed)
     default_date = pd.to_datetime("2023-01-01").date()
     today = datetime.now().date()
     date_range = st.slider("Timeline", pd.to_datetime("2020-01-01").date(), today, (default_date, today))
@@ -292,9 +253,8 @@ last = df.iloc[-1]
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("VIX Level", f"{last['CLOSE']:.2f}", f"{last['CLOSE'] - df.iloc[-2]['CLOSE']:.2f}")
 c2.metric("Regime", str(last['regime']).upper(), delta_color="off")
-# Show Fear & Greed in Header
-c3.metric("Fear & Greed", f"{last['FNG']:.0f}", help="CNN Index (0-100). <25 Extreme Fear, >75 Extreme Greed.")
-c4.metric("VPE Index", f"{last['VPE']:.0f}/100", "Energy")
+c3.metric("VPE Index", f"{last['VPE']:.0f}/100", "Energy")
+c4.metric("VVIX Level", f"{last['VVIX']:.2f}")
 sig_icon = "🟢" if "BUY" in last['chart_signal'] else "🔴" if "SELL" in last['chart_signal'] else "⚪"
 c5.metric("Model Signal", last['chart_signal'].replace("_", " "), sig_icon)
 
@@ -310,7 +270,7 @@ with st.expander("ℹ️ How to read the Price & Signal Chart"):
 fig = make_subplots(
     rows=4, cols=1, shared_xaxes=True, 
     row_heights=[0.5, 0.15, 0.15, 0.2], vertical_spacing=0.03,
-    subplot_titles=("VIX Price Action", "Z-Score", "Bollinger Width", "CNN Fear & Greed Index")
+    subplot_titles=("VIX Price Action", "Z-Score", "Bollinger Width", "VPE Index (Energy)")
 )
 
 # 1. Price
@@ -348,12 +308,10 @@ fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=2, col=1)
 fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['bb_width'], line=dict(color='yellow', width=1), name='BB Width'), row=3, col=1)
 fig.add_hline(y=df['bb_width'].quantile(active_thresh), line_dash="dot", line_color="orange", row=3, col=1)
 
-# 4. CNN Fear & Greed (Chart 4)
-# Using a color gradient for Fear (Red) to Greed (Green)
-# Since Plotly lines are single color, we plot it cyan but add colored zones
-fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['FNG'], fill='tozeroy', line=dict(color='#00e5ff', width=2), name='Fear & Greed'), row=4, col=1)
-fig.add_hline(y=25, line_dash="dot", line_color="red", annotation_text="Extreme Fear", row=4, col=1)
-fig.add_hline(y=75, line_dash="dot", line_color="green", annotation_text="Extreme Greed", row=4, col=1)
+# 4. VPE
+fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['VPE'], fill='tozeroy', line=dict(color='#d500f9', width=2), name='VPE'), row=4, col=1)
+fig.add_hline(y=90, line_dash="dot", line_color="red", row=4, col=1)
+fig.add_hline(y=10, line_dash="dot", line_color="gray", row=4, col=1)
 
 fig.update_layout(height=1000, template="plotly_dark", margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
@@ -361,11 +319,7 @@ st.plotly_chart(fig, use_container_width=True)
 # Ledger
 st.subheader("📋 Signal Ledger")
 st.dataframe(
-    df_filtered[['DATE', 'CLOSE', 'chart_signal', 'confidence', 'FNG', 'VPE']].sort_values('DATE', ascending=False), 
+    df_filtered[['DATE', 'CLOSE', 'chart_signal', 'confidence', 'VPE', 'z_score']].sort_values('DATE', ascending=False), 
     use_container_width=True, height=300, hide_index=True,
-    column_config={
-        "confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%d%%"),
-        "FNG": st.column_config.NumberColumn("Fear/Greed", format="%.0f"),
-        "VPE": st.column_config.NumberColumn("VPE Energy", format="%.0f")
-    }
+    column_config={"confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%d%%")}
 )
