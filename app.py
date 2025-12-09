@@ -228,7 +228,7 @@ med_latency = np.median(latencies) if latencies else 5
 # 4. DASHBOARD HEADER
 # -----------------------------------------------------------------------------
 st.title("🛡️ VIX Spike Predictor Pro")
-st.caption("AI-Driven Volatility Intelligence System")
+st.caption("Volatility Intelligence System")
 
 # Status Bar
 last = df.iloc[-1]
