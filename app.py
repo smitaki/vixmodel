@@ -102,9 +102,10 @@ def load_and_process_data():
     stats = {'learned_threshold': best_thresh}
     return df, stats
 
-# --- Signal Generator (Dynamic) ---
+# --- Signal Generator (Dynamic with Confidence) ---
 def apply_signals(df, squeeze_threshold):
     df['chart_signal'] = "HOLD"
+    df['confidence'] = 0.0 # Initialize confidence score (0-100)
     
     learned_sqz_val = df['bb_width'].quantile(squeeze_threshold)
     
@@ -116,7 +117,6 @@ def apply_signals(df, squeeze_threshold):
     # 2. VPE Signals (Master Energy)
     # BUY: High Potential Energy (>90)
     cond_vpe_buy = df['VPE'] > 90
-    
     # SELL: Energy Dissipated (<10)
     cond_vpe_sell = df['VPE'] < 10
     
@@ -124,13 +124,32 @@ def apply_signals(df, squeeze_threshold):
     cond_val = (df['z_score'] < -1.5) & (df['regime'].isin(['calm', 'normal']))
     cond_sell_ext = (df['z_score'] > 2.0) | (df['rsi'] > 75)
     
-    # Apply Signals (Later overwrites earlier)
-    df.loc[cond_val, 'chart_signal'] = 'BUY_VALUE'
-    df.loc[cond_sqz_final, 'chart_signal'] = 'BUY_SQUEEZE'
-    df.loc[cond_vpe_buy, 'chart_signal'] = 'BUY_VPE'      # Critical Energy (Replaces Breakout)
+    # --- Apply Signals & Calculate Confidence ---
     
-    df.loc[cond_vpe_sell, 'chart_signal'] = 'SELL_VPE'    # Energy Exhaustion
+    # A. Value Buy
+    # Confidence: How far below -1.5 Z-score? (Max confidence at -3.0)
+    df.loc[cond_val, 'chart_signal'] = 'BUY_VALUE'
+    df.loc[cond_val, 'confidence'] = ((df.loc[cond_val, 'z_score'].abs() - 1.5) / 1.5).clip(0, 1) * 100
+    
+    # B. Squeeze Buy
+    # Confidence: How tight is it compared to the threshold? 
+    # If Thresh is 0.10 and Width is 0.01, Confidence is high.
+    df.loc[cond_sqz_final, 'chart_signal'] = 'BUY_SQUEEZE'
+    # Avoid div/0 by using epsilon if learned_sqz_val is 0
+    safe_thresh = learned_sqz_val if learned_sqz_val > 0 else 0.001
+    df.loc[cond_sqz_final, 'confidence'] = ((safe_thresh - df.loc[cond_sqz_final, 'bb_width']) / safe_thresh).clip(0, 1) * 100
+    
+    # C. VPE Buy (Master) - Replaces Squeeze if valid
+    # Confidence: (VPE - 90) / 10 -> Scales 90-100 to 0-100%
+    df.loc[cond_vpe_buy, 'chart_signal'] = 'BUY_VPE'      
+    df.loc[cond_vpe_buy, 'confidence'] = ((df.loc[cond_vpe_buy, 'VPE'] - 90) / 10).clip(0, 1) * 100
+    
+    # D. Sells (Fixed high confidence for simplicity, or calculated)
+    df.loc[cond_vpe_sell, 'chart_signal'] = 'SELL_VPE'    
+    df.loc[cond_vpe_sell, 'confidence'] = ((10 - df.loc[cond_vpe_sell, 'VPE']) / 10).clip(0, 1) * 100
+    
     df.loc[cond_sell_ext, 'chart_signal'] = 'SELL_EXTREME'
+    df.loc[cond_sell_ext, 'confidence'] = 100 # Statistical extreme is always high conviction
     
     return df
 
@@ -308,4 +327,23 @@ with st.expander("⚡ Understanding the VPE (Potential Energy) Index"):
 # 7. LEDGER
 # -----------------------------------------------------------------------------
 st.subheader("📋 Signal Ledger")
-st.dataframe(df_filtered[['DATE', 'CLOSE', 'chart_signal', 'VPE', 'z_score']].sort_values('DATE', ascending=False), use_container_width=True, height=300)
+# We filter to show only rows where a signal exists, or just show latest history
+ledger_cols = ['DATE', 'CLOSE', 'chart_signal', 'confidence', 'VPE', 'z_score']
+st.dataframe(
+    df_filtered[ledger_cols].sort_values('DATE', ascending=False), 
+    use_container_width=True, 
+    height=300,
+    hide_index=True,
+    column_config={
+        "DATE": st.column_config.DatetimeColumn("Date", format="YYYY-MM-DD"),
+        "CLOSE": st.column_config.NumberColumn("VIX", format="%.2f"),
+        "confidence": st.column_config.ProgressColumn(
+            "Signal Confidence", 
+            min_value=0, 
+            max_value=100, 
+            format="%d%%"
+        ),
+        "VPE": st.column_config.NumberColumn("VPE Index", format="%.0f"),
+        "z_score": st.column_config.NumberColumn("Z-Score", format="%.2f"),
+    }
+)
