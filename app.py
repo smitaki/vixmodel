@@ -144,12 +144,12 @@ def apply_signals(df, squeeze_threshold):
     df.loc[cond_vpe_buy, 'chart_signal'] = 'BUY_VPE'      
     df.loc[cond_vpe_buy, 'confidence'] = ((df.loc[cond_vpe_buy, 'VPE'] - 90) / 10).clip(0, 1) * 100
     
-    # D. Sells (Fixed high confidence for simplicity, or calculated)
+    # D. Sells
     df.loc[cond_vpe_sell, 'chart_signal'] = 'SELL_VPE'    
     df.loc[cond_vpe_sell, 'confidence'] = ((10 - df.loc[cond_vpe_sell, 'VPE']) / 10).clip(0, 1) * 100
     
     df.loc[cond_sell_ext, 'chart_signal'] = 'SELL_EXTREME'
-    df.loc[cond_sell_ext, 'confidence'] = 100 # Statistical extreme is always high conviction
+    df.loc[cond_sell_ext, 'confidence'] = 100 # Extreme statistical deviation is high conviction
     
     return df
 
@@ -228,7 +228,7 @@ med_latency = np.median(latencies) if latencies else 5
 # 4. DASHBOARD HEADER
 # -----------------------------------------------------------------------------
 st.title("🛡️ VIX Spike Predictor Pro")
-st.caption("Volatility Intelligence System")
+st.caption("AI-Driven Volatility Intelligence System")
 
 # Status Bar
 last = df.iloc[-1]
