@@ -238,7 +238,7 @@ if raw_df is None:
     st.stop()
 
 # Determine active threshold
-active_thresh = ai_stats['learned_threshold'] if mode == "AI Auto-Pilot" else manual_thresh
+active_thresh = ai_stats['learned_threshold'] if mode == "Auto-Pilot" else manual_thresh
 
 # Apply Logic
 df = apply_signals(raw_df.copy(), active_thresh)
@@ -247,7 +247,7 @@ df_filtered = df.loc[mask]
 
 # Dashboard Header
 st.title("🛡️ VIX Spike Predictor Pro")
-st.caption("AI-Driven Volatility Intelligence System")
+st.caption("Volatility Intelligence System")
 
 last = df.iloc[-1]
 c1, c2, c3, c4, c5 = st.columns(5)
