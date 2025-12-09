@@ -4,8 +4,7 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
-from sklearn.cluster import KMeans
+from datetime import datetime, timedelta
 import time
 
 # -----------------------------------------------------------------------------
@@ -21,12 +20,8 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # 2. CONFIGURATION & CONSTANTS
 # -----------------------------------------------------------------------------
-# We use a start date that ensures we get VVIX data (which started later than VIX)
 START_DATE = "2007-01-01" 
 ROLLING_WINDOW = 30
-ANALOG_LEVEL_TOL = 0.05
-ANALOG_VOL_TOL = 0.10
-DAILY_SPIKE_THRESH = 0.10
 
 # -----------------------------------------------------------------------------
 # 3. DATA LOADING & ADVANCED LOGIC
@@ -85,10 +80,8 @@ def load_and_process_data():
     
     # 3. Standard Metrics
     df['z_score'] = (df['CLOSE'] - df['rolling_mean_20d']) / df['rolling_std_20d']
-    df['vcr'] = (df['CLOSE'] / df['rolling_mean_20d'] - 1) * 100
-    df["rolling_vol_30d"] = df["daily_return"].rolling(ROLLING_WINDOW).std() * np.sqrt(252)
-
-    # 4. Context Layers (New Logic)
+    
+    # 4. Context Layers
     # SPX Trend (Equity Filter)
     df['spx_ma50'] = df['SPX'].rolling(50).mean()
     df['spx_trend'] = np.where(df['SPX'] > df['spx_ma50'], "UPTREND", "FRAGILE")
@@ -97,26 +90,20 @@ def load_and_process_data():
     df['vvix_ma10'] = df['VVIX'].rolling(10).mean()
     
     # 5. Inter-Arrival Time (Recharge Logic)
-    # Mark Spike Days (>20 level AND >10% move)
     spike_days = df[(df['CLOSE'] > 20) & (df['daily_return'] > 0.10)].index
     df['days_since_spike'] = np.nan
     
     if not spike_days.empty:
-        # Calculate days since the last major spike for every row
         last_spike_idx = pd.Series(spike_days, index=spike_days).reindex(df.index, method='ffill')
-        # Approximate days by row count difference (assuming trading days)
         df['days_since_spike'] = (df.index - last_spike_idx) 
     
     # Regimes
     regime_labels = ["calm", "normal", "elevated", "stressed"]
     df["regime"] = pd.qcut(df["CLOSE"], q=4, labels=regime_labels)
 
-    # --- B. DYNAMIC SEASONALITY (Replacing Hardcoded Data) ---
-    # Calculate the average "Gap Between Spikes" for the current month based on history
+    # --- B. DYNAMIC SEASONALITY ---
     stats = {}
     current_month = df['DATE'].iloc[-1].month
-    
-    # Filter spikes that happened in this specific month historically
     historical_spikes = df[df['daily_return'] > 0.10].copy()
     month_spikes = historical_spikes[historical_spikes['DATE'].dt.month == current_month]
     
@@ -126,43 +113,32 @@ def load_and_process_data():
     else:
         stats['seasonal_freq'] = "N/A (Rare)"
 
-    # --- C. SIGNAL GENERATION (With Filters) ---
-    
-    # Define Thresholds
-    bb_squeeze_level = df['bb_width'].quantile(0.10) # Bottom 10%
-    
+    # --- C. SIGNAL GENERATION ---
+    bb_squeeze_level = df['bb_width'].quantile(0.10)
     df['chart_signal'] = "HOLD"
     
-    # Logic 1: Squeeze Buy (The Coiled Spring)
-    # Filter: Don't buy squeeze if SPX is in a raging Uptrend (Grind Up) AND VVIX is dead
+    # Signal Logic
     cond_squeeze_raw = (df['bb_width'] < bb_squeeze_level) & (df['CLOSE'] <= df['rolling_mean_20d'])
     cond_spx_filter = (df['spx_trend'] == "UPTREND") & (df['VVIX'] < df['VVIX'].rolling(50).mean())
-    cond_squeeze_buy = cond_squeeze_raw & (~cond_spx_filter) # Only buy if NOT filtered
+    cond_squeeze_buy = cond_squeeze_raw & (~cond_spx_filter)
     
-    # Logic 2: Value Buy (Mean Reversion)
     cond_value_buy = (df['z_score'] < -1.5) & (df['regime'].isin(['calm', 'normal']))
-    
-    # Logic 3: Sell (Extremes)
     cond_sell = (df['z_score'] > 2.0) | (df['rsi'] > 75)
     
-    # Apply Signals to Ledger
     df.loc[cond_value_buy, 'chart_signal'] = 'BUY_VALUE'
     df.loc[cond_squeeze_buy, 'chart_signal'] = 'BUY_SQUEEZE'
     df.loc[cond_sell, 'chart_signal'] = 'SELL_EXTREME'
 
-    # --- D. LATENCY ANALYSIS (Learning from History) ---
-    # 1. Median Latency (Days from Squeeze Signal to >10% Spike)
+    # --- D. LATENCY ANALYSIS ---
     squeeze_indices = df[df['chart_signal'] == 'BUY_SQUEEZE'].index
     latencies = []
     
-    # Look at last 50 signals to keep it relevant
     for idx in squeeze_indices[-50:]: 
-        # Look forward 30 days
         if idx + 30 < len(df):
             forward_window = df.iloc[idx+1 : idx+30]
             spike_found = forward_window[forward_window['daily_return'] > 0.10]
             if not spike_found.empty:
-                days_to_spike = (spike_found.index[0] - idx) # Row delta
+                days_to_spike = (spike_found.index[0] - idx)
                 latencies.append(days_to_spike)
             
     stats['median_latency'] = np.median(latencies) if latencies else 5 
@@ -173,51 +149,92 @@ def load_and_process_data():
     
     if len(df) > 30:
         latest = df.iloc[-1]
-        
-        # Check Filters
         is_uptrend = latest['spx_trend'] == "UPTREND"
         vvix_confirm = latest['VVIX'] > latest['vvix_ma10']
         
         signal = "HOLD"
         reason = "Monitoring"
         
-        # Priority 1: Squeeze
         if latest['bb_width'] < bb_squeeze_level:
             if is_uptrend and not vvix_confirm:
-                reason = "Squeeze Detected BUT filtered by SPX Uptrend (Grind Up Risk)."
+                reason = "Squeeze Detected BUT filtered by SPX Uptrend."
                 signal = "HOLD (FILTERED)"
             else:
                 signal = "STRONG_BUY_VOL_SQUEEZE"
-                reason = f"⚠️ SQUEEZE. BB Width ({latest['bb_width']:.2f}) < 10%. Latency: ~{stats['median_latency']:.0f} days."
+                reason = f"⚠️ SQUEEZE. BB Width ({latest['bb_width']:.2f}) < 10%."
 
-        # Priority 2: Deep Value
         elif (latest["regime"] == "calm") and (latest["z_score"] < -1.5):
             signal = "BUY_VIX_CALLS"
             reason = f"Deep Value (Z: {latest['z_score']:.2f})."
             
-        # Priority 3: Sell
         elif (latest["regime"] == "stressed") and (latest["z_score"] > 2.0):
             signal = "SELL_VIX"
-            reason = "Statistical Extreme. Mean Reversion likely."
+            reason = "Statistical Extreme."
 
         df.at[df.index[-1], "signal"] = signal
         df.at[df.index[-1], "signal_reason"] = reason
         
-        # Sync chart tag logic for the very last day
         tag = "HOLD"
         if "SQUEEZE" in signal: tag = "BUY_SQUEEZE"
         elif "BUY" in signal: tag = "BUY_VALUE"
         elif "SELL" in signal: tag = "SELL_EXTREME"
-        
         if tag != "HOLD": df.at[df.index[-1], 'chart_signal'] = tag
 
     return df, stats
+
+# ==========================================
+# 4. FORECASTING ENGINE (NEW)
+# ==========================================
+def generate_monte_carlo_forecast(data, days_ahead=21, num_simulations=1000):
+    """
+    Simulates future VIX paths based on historical volatility of the CURRENT Regime.
+    """
+    current_vix = data['CLOSE'].iloc[-1]
+    current_regime = data['regime'].iloc[-1]
+    
+    # 1. Get historical daily changes for this specific regime
+    regime_data = data[data['regime'] == current_regime]
+    daily_changes = regime_data['CLOSE'].diff().dropna()
+    
+    if len(daily_changes) < 10:
+        daily_changes = data['CLOSE'].diff().dropna() # Fallback
+
+    # 2. Monte Carlo Simulation
+    simulation_results = np.zeros((days_ahead, num_simulations))
+    
+    for i in range(num_simulations):
+        path = [current_vix]
+        random_shocks = np.random.choice(daily_changes, days_ahead)
+        
+        for shock in random_shocks:
+            # Add simple mean reversion drift (Pull towards 19.5)
+            drift = 0.05 * (19.5 - path[-1]) 
+            next_price = path[-1] + drift + shock
+            next_price = max(9, next_price) # Floor at 9
+            path.append(next_price)
+            
+        simulation_results[:, i] = path[1:]
+        
+    # 3. Aggregate results
+    last_date = data['DATE'].iloc[-1]
+    forecast_dates = [last_date + timedelta(days=i) for i in range(1, days_ahead + 1)]
+    
+    median_path = np.median(simulation_results, axis=1)
+    upper_bound = np.percentile(simulation_results, 90, axis=1)
+    lower_bound = np.percentile(simulation_results, 10, axis=1)
+    
+    return pd.DataFrame({
+        'DATE': forecast_dates,
+        'Forecast': median_path,
+        'Upper': upper_bound,
+        'Lower': lower_bound
+    })
 
 # Load Data & Stats
 df, stats = load_and_process_data()
 
 # -----------------------------------------------------------------------------
-# 4. SIDEBAR
+# 5. SIDEBAR
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -229,7 +246,6 @@ with st.sidebar:
     # Date Slider
     min_date = df['DATE'].min().date()
     max_date = df['DATE'].max().date()
-    # Default to recent history (2023+)
     default_start = max(min_date, pd.to_datetime("2023-01-01").date())
     
     start_date, end_date = st.slider(
@@ -239,14 +255,14 @@ with st.sidebar:
     
     st.markdown("### Chart Overlays")
     show_bollinger = st.checkbox("Show Bollinger Bands", value=True)
-    show_context = st.checkbox("Show SPX/VVIX Context", value=False) # Toggle for extra data
+    show_forecast = st.checkbox("Show Forecast Model", value=True) # New Checkbox
 
 # Filter Data by Date
 mask = (df['DATE'].dt.date >= start_date) & (df['DATE'].dt.date <= end_date)
 df_filtered = df.loc[mask]
 
 # -----------------------------------------------------------------------------
-# 5. HEADER & METRICS
+# 6. HEADER & METRICS
 # -----------------------------------------------------------------------------
 st.title("🛡️ VIX Spike Predictor Pro")
 st.caption("Mathematical Model: Derived entirely from historical market data (No hardcoded scenarios).")
@@ -259,8 +275,8 @@ delta_vix = latest['CLOSE'] - df.iloc[-2]['CLOSE']
 c1, c2, c3, c4, c5 = st.columns(5)
 with c1: st.metric("VIX Level", f"{latest['CLOSE']:.2f}", f"{delta_vix:.2f}")
 with c2: st.metric("Regime", str(latest['regime']).upper(), delta_color="off")
-with c3: st.metric("SPX Trend", latest['spx_trend'], help="Uptrends often invalidate VIX signals")
-with c4: st.metric("VVIX Level", f"{latest['VVIX']:.2f}", help="Vol of Vol - The 'Smart Money' Indicator")
+with c3: st.metric("SPX Trend", latest['spx_trend'])
+with c4: st.metric("VVIX Level", f"{latest['VVIX']:.2f}")
 with c5:
     sig = latest['signal']
     if "BUY" in sig: st.success(f"🔼 {sig}")
@@ -270,28 +286,25 @@ with c5:
 # Row 2: Timing Intelligence
 st.markdown("#### ⏳ Timing Intelligence (Derived from History)")
 t1, t2, t3, t4 = st.columns(4)
-with t1:
-    st.metric("Est. Latency", f"~{stats['median_latency']:.0f} Days", help="Median days from Signal to Spike")
-with t2:
-    st.metric("Suggested Option DTE", f"{int(stats['median_latency']*1.5)}-{int(stats['median_latency']*4)} Days", help="Ideal expiration window based on latency")
-with t3:
-    month_name = df['DATE'].iloc[-1].strftime('%B')
+with t1: st.metric("Est. Latency", f"~{stats['median_latency']:.0f} Days")
+with t2: st.metric("Suggested Option DTE", f"{int(stats['median_latency']*1.5)}-{int(stats['median_latency']*4)} Days")
+with t3: 
     freq = stats.get('seasonal_freq', 'N/A')
-    st.metric(f"{month_name} Seasonality", f"{freq} Days", help=f"Avg gap between spikes in {month_name} historically.")
+    st.metric(f"Seasonality", f"{freq} Days")
 with t4:
     last_spike = df_filtered[df_filtered['daily_return'] > 0.10].index.max()
     days_ago = (df_filtered.index.max() - last_spike) if pd.notna(last_spike) else 0
-    st.metric("Recharge Meter", f"{days_ago} Days Ago", help="Days since last major spike (>10%).")
+    st.metric("Recharge Meter", f"{days_ago} Days Ago")
 
 # -----------------------------------------------------------------------------
-# 6. CHARTING
+# 7. CHARTING
 # -----------------------------------------------------------------------------
 fig = make_subplots(
     rows=3, cols=1, 
     shared_xaxes=True, 
     vertical_spacing=0.05, 
     row_heights=[0.6, 0.2, 0.2],
-    subplot_titles=("VIX Price & Signals", "Z-Score (Deviation)", "Squeeze Metric (BB Width)")
+    subplot_titles=("VIX Price & Forecast", "Z-Score (Deviation)", "Squeeze Metric (BB Width)")
 )
 
 # --- TRACE 1: Price ---
@@ -301,6 +314,32 @@ fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['CLOSE'], mode='li
 if show_bollinger:
     fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['bollinger_upper'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['bollinger_lower'], fill='tonexty', fillcolor='rgba(255, 255, 255, 0.05)', mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'), row=1, col=1)
+
+# --- FORECAST INTEGRATION ---
+if show_forecast:
+    forecast_df = generate_monte_carlo_forecast(df, days_ahead=21)
+    
+    # Combined Upper/Lower for Fill
+    x_combined = list(forecast_df['DATE']) + list(forecast_df['DATE'])[::-1]
+    y_combined = list(forecast_df['Upper']) + list(forecast_df['Lower'])[::-1]
+    
+    # 1. Confidence Interval (Cloud)
+    fig.add_trace(go.Scatter(
+        x=x_combined, y=y_combined,
+        fill='toself',
+        fillcolor='rgba(0, 229, 255, 0.15)', # Cyan tint
+        line=dict(color='rgba(255,255,255,0)'),
+        name='Forecast Range',
+        showlegend=True
+    ), row=1, col=1)
+
+    # 2. Median Line
+    fig.add_trace(go.Scatter(
+        x=forecast_df['DATE'], y=forecast_df['Forecast'],
+        mode='lines',
+        line=dict(color='#ffeb3b', width=2, dash='dash'), # Yellow Dashed
+        name='Forecast Median'
+    ), row=1, col=1)
 
 # Signals
 buy_sqz = df_filtered[df_filtered['chart_signal'] == "BUY_SQUEEZE"]
@@ -320,7 +359,6 @@ fig.add_hline(y=-1.5, line_dash="dash", line_color="green", row=2, col=1)
 
 # --- TRACE 3: BB Width (Squeeze) ---
 fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['bb_width'], mode='lines', name='BB Width', line=dict(color='yellow', width=1)), row=3, col=1)
-# Add Squeeze Threshold Line
 squeeze_thresh = df['bb_width'].quantile(0.10)
 fig.add_hline(y=squeeze_thresh, line_dash="dot", line_color="orange", annotation_text="Squeeze Zone (10%)", row=3, col=1)
 
@@ -328,7 +366,7 @@ fig.update_layout(height=800, template="plotly_dark", margin=dict(l=10, r=10, t=
 st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 7. HISTORICAL LEDGER
+# 8. HISTORICAL LEDGER
 # -----------------------------------------------------------------------------
 st.subheader("📋 Historical Ledger")
 cols = ['DATE', 'CLOSE', 'chart_signal', 'regime', 'bb_width', 'z_score', 'spx_trend', 'VVIX']
@@ -345,7 +383,5 @@ st.dataframe(
         "bb_width": st.column_config.NumberColumn("BB Width", format="%.3f"),
         "z_score": st.column_config.NumberColumn("Z-Score", format="%.2f"),
         "VVIX": st.column_config.NumberColumn("VVIX", format="%.2f"),
-        "chart_signal": st.column_config.TextColumn("Signal"),
-        "spx_trend": st.column_config.TextColumn("Context"),
     }
 )
