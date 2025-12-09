@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -28,29 +29,67 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. DATA LOADING & MODELING (DYNAMIC INPUTS)
+# 2. DATA LOADING (VIX + CNN FEAR & GREED)
 # -----------------------------------------------------------------------------
 START_DATE = "2007-01-01" 
 
+@st.cache_data(ttl=3600) # Cache CNN data for 1 hour to prevent blocking
+def get_cnn_fear_greed():
+    """
+    Fetches historical Fear & Greed Index directly from CNN's API.
+    """
+    url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        
+        # Parse Historical Data
+        history = data['fear_and_greed_historical']['data']
+        fng_df = pd.DataFrame(history)
+        
+        # Convert Timestamp (ms) to DateTime
+        fng_df['DATE'] = pd.to_datetime(fng_df['x'], unit='ms').dt.normalize()
+        fng_df = fng_df.rename(columns={'y': 'FNG'})
+        
+        # Aggregate duplicates (sometimes CNN returns multiple points per day)
+        fng_df = fng_df.groupby('DATE')['FNG'].mean().reset_index()
+        return fng_df[['DATE', 'FNG']]
+        
+    except Exception as e:
+        print(f"Error fetching CNN data: {e}")
+        return pd.DataFrame(columns=['DATE', 'FNG'])
+
 @st.cache_data(ttl=60)
 def load_and_process_data(lookback_days=20, fear_mult=1.0):
+    # 1. Fetch Market Data (Yahoo)
     tickers = ["^VIX", "^GSPC", "^VVIX"]
     data = yf.download(tickers, start=START_DATE, progress=False)
     
     if data.empty: return None, None
     
-    # Clean Data
     close_df = data['Close'].copy() if isinstance(data.columns, pd.MultiIndex) else data['Close'].copy()
     df = close_df.reset_index().rename(columns={'Date': 'DATE', '^VIX': 'CLOSE', '^GSPC': 'SPX', '^VVIX': 'VVIX'})
-    df['DATE'] = pd.to_datetime(df['DATE'])
+    df['DATE'] = pd.to_datetime(df['DATE']).dt.normalize() # Normalize to remove time component
     df = df.sort_values("DATE").reset_index(drop=True)
     df['VVIX'] = df['VVIX'].ffill() 
     df.dropna(inplace=True)
 
-    # --- Indicators (Using Lookback Input) ---
+    # 2. Fetch & Merge CNN Fear & Greed
+    fng_df = get_cnn_fear_greed()
+    if not fng_df.empty:
+        # Left join to keep all trading days, fill missing FNG with forward fill
+        df = pd.merge(df, fng_df, on='DATE', how='left')
+        df['FNG'] = df['FNG'].ffill()
+    else:
+        df['FNG'] = 50 # Default neutral if fetch fails
+
+    # 3. Indicators
     df["daily_return"] = df["CLOSE"].pct_change()
-    
-    # Dynamic Rolling Window based on user input
     df["rolling_mean"] = df["CLOSE"].rolling(lookback_days).mean()
     df["rolling_std"] = df["CLOSE"].rolling(lookback_days).std()
     
@@ -58,7 +97,6 @@ def load_and_process_data(lookback_days=20, fear_mult=1.0):
     df['bollinger_lower'] = df['rolling_mean'] - (2 * df['rolling_std'])
     df['bb_width'] = (df['bollinger_upper'] - df['bollinger_lower']) / df['rolling_mean']
     
-    # Momentum
     delta = df['CLOSE'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -66,19 +104,17 @@ def load_and_process_data(lookback_days=20, fear_mult=1.0):
     df['rsi'] = 100 - (100 / (1 + rs))
     df['z_score'] = (df['CLOSE'] - df['rolling_mean']) / df['rolling_std']
     
-    # Context
     df['spx_ma50'] = df['SPX'].rolling(50).mean()
     df['spx_trend'] = np.where(df['SPX'] > df['spx_ma50'], "UPTREND", "FRAGILE")
     df['vvix_ma10'] = df['VVIX'].rolling(10).mean()
     df["regime"] = pd.qcut(df["CLOSE"], q=4, labels=["calm", "normal", "elevated", "stressed"])
 
-    # --- VPE Index (Energy) WITH FEAR MULTIPLIER ---
-    # Formula: (VVIX * Sensitivity) / (Width * Price)
+    # 4. VPE Index (Updated to use FNG as a factor if desired, currently kept standard)
     epsilon = 1e-6
     df['vpe_raw'] = (df['VVIX'] * fear_mult) / ((df['bb_width'] * df['CLOSE']) + epsilon)
     df['VPE'] = df['vpe_raw'].rolling(252).rank(pct=True) * 100
 
-    # --- AI Learning (Walk-Forward Optimization) ---
+    # 5. AI Learning
     potential_thresholds = [0.05, 0.10, 0.15] 
     best_thresh = 0.10 
     best_score = -1
@@ -119,7 +155,7 @@ def apply_signals(df, squeeze_threshold):
     cond_val = (df['z_score'] < -1.5) & (df['regime'].isin(['calm', 'normal']))
     cond_sell_ext = (df['z_score'] > 2.0) | (df['rsi'] > 75)
     
-    # Apply & Score
+    # --- Signals ---
     df.loc[cond_val, 'chart_signal'] = 'BUY_VALUE'
     df.loc[cond_val, 'confidence'] = ((df.loc[cond_val, 'z_score'].abs() - 1.5) / 1.5).clip(0, 1) * 100
     
@@ -138,11 +174,10 @@ def apply_signals(df, squeeze_threshold):
     
     return df
 
-# --- Forecast Engine (Regime Override) ---
+# --- Forecast Engine ---
 def generate_forecast(data, days_ahead=21, num_sims=1000, regime_mode="Auto-Detect"):
     curr_vix = data['CLOSE'].iloc[-1]
     
-    # LOGIC: Filter historical data based on User Input
     if "Force Calm" in regime_mode:
         regime_data = data[data['CLOSE'] < 15]
     elif "Force Stressed" in regime_mode:
@@ -150,7 +185,6 @@ def generate_forecast(data, days_ahead=21, num_sims=1000, regime_mode="Auto-Dete
     elif "Force Crisis" in regime_mode:
         regime_data = data[data['CLOSE'] > 40]
     else:
-        # Auto-Detect (Default)
         curr_regime = data['regime'].iloc[-1]
         regime_data = data[data['regime'] == curr_regime]
 
@@ -174,47 +208,30 @@ def generate_forecast(data, days_ahead=21, num_sims=1000, regime_mode="Auto-Dete
     })
 
 # -----------------------------------------------------------------------------
-# 3. SIDEBAR (CONTROLS)
+# 3. SIDEBAR
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("🎛️ Control Panel")
     
-    # 1. Timeline (Existing)
-    # We load minimal data first just to get min/max dates for slider
-    # (In production you might optimize this, here we just hardcode defaults for speed)
+    # 1. Timeline
     default_date = pd.to_datetime("2023-01-01").date()
     today = datetime.now().date()
     date_range = st.slider("Timeline", pd.to_datetime("2020-01-01").date(), today, (default_date, today))
     
     st.markdown("---")
     
-    # 2. SCENARIO LAB (NEW INPUTS)
+    # 2. SCENARIO LAB
     st.subheader("🧪 Scenario Lab")
-    
-    # Input A: Regime Override
     regime_override = st.selectbox(
         "Forecast Mode", 
-        ["Auto-Detect", "Force Calm (<15)", "Force Stressed (>25)", "Force Crisis (>40)"],
-        help="Simulate how the forecast looks if we were in a different market regime."
+        ["Auto-Detect", "Force Calm (<15)", "Force Stressed (>25)", "Force Crisis (>40)"]
     )
-    
-    # Input B: Lookback Window
-    lookback = st.slider(
-        "Trend Baseline (Days)", 
-        10, 50, 20, 
-        help="Lower = Faster signals (Scalping). Higher = Slower signals (Investing)."
-    )
-    
-    # Input C: Fear Sensitivity
-    fear_mult = st.slider(
-        "Fear Sensitivity", 
-        0.5, 2.0, 1.0, 0.1, 
-        help="Multiplies VVIX impact. Increase to catch early/weak signals."
-    )
+    lookback = st.slider("Trend Baseline (Days)", 10, 50, 20)
+    fear_mult = st.slider("Fear Sensitivity", 0.5, 2.0, 1.0, 0.1)
     
     st.markdown("---")
 
-    # 3. Model Sensitivity (Existing)
+    # 3. Model Settings
     st.subheader("⚙️ Model Settings")
     mode = st.radio("Threshold Strategy", ["AI Auto-Pilot", "Manual Override"], index=0)
     manual_thresh = 0.10
@@ -229,48 +246,44 @@ with st.sidebar:
     show_backtest = st.toggle("Show Backtest", value=False)
 
 # -----------------------------------------------------------------------------
-# 4. EXECUTION & DASHBOARD
+# 4. DASHBOARD
 # -----------------------------------------------------------------------------
-# Load Data with User Inputs
 raw_df, ai_stats = load_and_process_data(lookback_days=lookback, fear_mult=fear_mult)
 
 if raw_df is None:
+    st.error("Data loading failed. Please check your internet connection.")
     st.stop()
 
-# Determine active threshold
-active_thresh = ai_stats['learned_threshold'] if mode == "Auto-Pilot" else manual_thresh
-
-# Apply Logic
+active_thresh = ai_stats['learned_threshold'] if mode == "AI Auto-Pilot" else manual_thresh
 df = apply_signals(raw_df.copy(), active_thresh)
 mask = (df['DATE'].dt.date >= date_range[0]) & (df['DATE'].dt.date <= date_range[1])
 df_filtered = df.loc[mask]
 
-# Dashboard Header
 st.title("🛡️ VIX Spike Predictor Pro")
-st.caption("Volatility Intelligence System")
+st.caption("AI-Driven Volatility Intelligence System")
 
 last = df.iloc[-1]
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("VIX Level", f"{last['CLOSE']:.2f}", f"{last['CLOSE'] - df.iloc[-2]['CLOSE']:.2f}")
 c2.metric("Regime", str(last['regime']).upper(), delta_color="off")
-c3.metric("VPE Index", f"{last['VPE']:.0f}/100", "Energy")
-c4.metric("VVIX Level", f"{last['VVIX']:.2f}")
+# Display FEAR & GREED instead of VVIX (or alongside)
+c3.metric("Fear & Greed", f"{last['FNG']:.0f}", help="CNN Fear & Greed Index (0-100)")
+c4.metric("VPE Index", f"{last['VPE']:.0f}/100", "Energy")
+
 sig_icon = "🟢" if "BUY" in last['chart_signal'] else "🔴" if "SELL" in last['chart_signal'] else "⚪"
 c5.metric("Model Signal", last['chart_signal'].replace("_", " "), sig_icon)
 
-# Charts
 with st.expander("ℹ️ How to read the Price & Signal Chart"):
     st.markdown("""
     * **Purple Diamonds (VPE Buy):** Critical Energy (>90). The spring is coiled tight. Spike imminent.
     * **Orange Stars (Squeeze):** Low Volatility. Bands are tight.
-    * **Grey Cross (VPE Sell):** Energy Dissipated (<10). Market is dormant or exhausted.
     * **Red Triangles (Sell Extreme):** Statistical Over-extension (Z-Score > 2).
     """)
 
 fig = make_subplots(
     rows=4, cols=1, shared_xaxes=True, 
     row_heights=[0.5, 0.15, 0.15, 0.2], vertical_spacing=0.03,
-    subplot_titles=("VIX Price Action", "Z-Score", "Bollinger Width", "VPE Index (Energy)")
+    subplot_titles=("VIX Price Action", "Z-Score", "Bollinger Width", "CNN Fear & Greed Index")
 )
 
 # 1. Price
@@ -284,7 +297,6 @@ if show_backtest:
             fig.add_vrect(x0=row['DATE'], x1=row['DATE'] + timedelta(days=5), fillcolor=color, layer="below", line_width=0, row=1, col=1)
 
 if show_forecast:
-    # Pass the REGIME OVERRIDE to the forecast engine
     f_df = generate_forecast(df, 21, regime_mode=regime_override)
     x = list(f_df['DATE']) + list(f_df['DATE'])[::-1]
     y = list(f_df['Upper']) + list(f_df['Lower'])[::-1]
@@ -308,10 +320,11 @@ fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=2, col=1)
 fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['bb_width'], line=dict(color='yellow', width=1), name='BB Width'), row=3, col=1)
 fig.add_hline(y=df['bb_width'].quantile(active_thresh), line_dash="dot", line_color="orange", row=3, col=1)
 
-# 4. VPE
-fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['VPE'], fill='tozeroy', line=dict(color='#d500f9', width=2), name='VPE'), row=4, col=1)
-fig.add_hline(y=90, line_dash="dot", line_color="red", row=4, col=1)
-fig.add_hline(y=10, line_dash="dot", line_color="gray", row=4, col=1)
+# 4. CNN Fear & Greed (REPLACED VPE CHART)
+# Using a color gradient for Fear (Red) to Greed (Green)
+fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['FNG'], fill='tozeroy', line=dict(color='#00e5ff', width=2), name='Fear & Greed'), row=4, col=1)
+fig.add_hline(y=25, line_dash="dot", line_color="red", annotation_text="Extreme Fear", row=4, col=1)
+fig.add_hline(y=75, line_dash="dot", line_color="green", annotation_text="Extreme Greed", row=4, col=1)
 
 fig.update_layout(height=1000, template="plotly_dark", margin=dict(l=10, r=10, t=10, b=10), hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
@@ -319,7 +332,10 @@ st.plotly_chart(fig, use_container_width=True)
 # Ledger
 st.subheader("📋 Signal Ledger")
 st.dataframe(
-    df_filtered[['DATE', 'CLOSE', 'chart_signal', 'confidence', 'VPE', 'z_score']].sort_values('DATE', ascending=False), 
+    df_filtered[['DATE', 'CLOSE', 'chart_signal', 'confidence', 'FNG', 'VPE']].sort_values('DATE', ascending=False), 
     use_container_width=True, height=300, hide_index=True,
-    column_config={"confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%d%%")}
+    column_config={
+        "confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%d%%"),
+        "FNG": st.column_config.NumberColumn("Fear/Greed", format="%.0f")
+    }
 )
