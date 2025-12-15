@@ -95,8 +95,8 @@ def load_and_process_data(lookback_days=20, fear_mult=1.0):
     df['spx_trend'] = np.where(df['SPX'] > df['spx_ma50'], "UPTREND", "FRAGILE")
     df['vvix_ma10'] = df['VVIX'].rolling(10).mean()
     
-    # --- FIXED REGIME CALCULATION (No qcut error) ---
-    # We use rank(pct=True) instead of qcut to handle duplicate values safely
+    # --- FIXED REGIME CALCULATION (Prevents qcut crash) ---
+    # Using percentile rank is safer than qcut for data with many duplicates
     qtls = df["CLOSE"].rank(pct=True)
     df["regime"] = np.where(qtls < 0.25, "calm", 
                    np.where(qtls < 0.5, "normal",
@@ -145,20 +145,32 @@ def apply_signals(df, squeeze_threshold):
     cond_vpe_buy = df['VPE'] > 90
     cond_vpe_sell = df['VPE'] < 10
     
-    cond_val = (df['z_score'] < -1.5) & (df['regime'] == 'calm') # simple string check
+    # Value Buys
+    cond_val = (df['z_score'] < -1.5) & (df['regime'].isin(['calm', 'normal']))
+    cond_buy_ext = (df['z_score'] < -2.0) # BUY EXTREME Logic
+    
     cond_sell_ext = (df['z_score'] > 2.0) | (df['rsi'] > 75)
     
     # Apply & Score
+    
+    # 1. Buy Value (Z < -1.5)
     df.loc[cond_val, 'chart_signal'] = 'BUY_VALUE'
     df.loc[cond_val, 'confidence'] = ((df.loc[cond_val, 'z_score'].abs() - 1.5) / 1.5).clip(0, 1) * 100
     
+    # 2. Buy Extreme (Z < -2.0) - Replaces Value if deeper
+    df.loc[cond_buy_ext, 'chart_signal'] = 'BUY_EXTREME'
+    df.loc[cond_buy_ext, 'confidence'] = 100 # Maximum confidence
+    
+    # 3. Squeeze
     safe_thresh = learned_sqz_val if learned_sqz_val > 0 else 0.001
     df.loc[cond_sqz_final, 'chart_signal'] = 'BUY_SQUEEZE'
     df.loc[cond_sqz_final, 'confidence'] = ((safe_thresh - df.loc[cond_sqz_final, 'bb_width']) / safe_thresh).clip(0, 1) * 100
     
+    # 4. VPE (Master)
     df.loc[cond_vpe_buy, 'chart_signal'] = 'BUY_VPE'      
     df.loc[cond_vpe_buy, 'confidence'] = ((df.loc[cond_vpe_buy, 'VPE'] - 90) / 10).clip(0, 1) * 100
     
+    # 5. Sells
     df.loc[cond_vpe_sell, 'chart_signal'] = 'SELL_VPE'    
     df.loc[cond_vpe_sell, 'confidence'] = ((10 - df.loc[cond_vpe_sell, 'VPE']) / 10).clip(0, 1) * 100
     
@@ -203,21 +215,19 @@ def generate_forecast(data, days_ahead=21, num_sims=1000, regime_mode="Auto-Dete
 # -----------------------------------------------------------------------------
 # 3. SIDEBAR
 # -----------------------------------------------------------------------------
-# We need to load data *first* to get FNG for the sidebar logic
-raw_df_preview, _ = load_and_process_data(20, 1.0) # Pre-load with defaults
+# Pre-load for sidebar logic
+raw_df_preview, _ = load_and_process_data(20, 1.0) 
 latest_fng = raw_df_preview['FNG'].iloc[-1] if raw_df_preview is not None else 50
 
 with st.sidebar:
     st.header("🎛️ Control Panel")
     
-    # 1. Timeline
     default_date = pd.to_datetime("2023-01-01").date()
     today = datetime.now().date()
     date_range = st.slider("Timeline", pd.to_datetime("2020-01-01").date(), today, (default_date, today))
     
     st.markdown("---")
     
-    # 2. SCENARIO LAB
     st.subheader("🧪 Scenario Lab")
     
     regime_override = st.selectbox(
@@ -227,23 +237,18 @@ with st.sidebar:
     
     lookback = st.slider("Trend Baseline (Days)", 10, 50, 20)
     
-    # --- AUTO-TUNE FEAR LOGIC ---
     st.markdown("##### Fear Sensitivity")
-    auto_tune = st.checkbox("🤖 Auto-Tune with Fear & Greed", value=False, help="Increases sensitivity if Market is Greedy (Complacent).")
+    auto_tune = st.checkbox("🤖 Auto-Tune with Fear & Greed", value=False, help="Increases sensitivity if Market is Greedy.")
     
     if auto_tune:
-        # Formula: Base 1.0 + (Deviation from 50 / 100)
-        # Greedy (75) -> 1.0 + 0.25 = 1.25x (More Sensitive)
-        # Fearful (25) -> 1.0 - 0.25 = 0.75x (Less Sensitive)
         computed_mult = 1.0 + ((latest_fng - 50) / 100)
-        fear_mult = max(0.5, min(2.0, computed_mult)) # Clamp
+        fear_mult = max(0.5, min(2.0, computed_mult)) 
         st.success(f"Market F&G: {latest_fng:.0f}. Sensitivity: **{fear_mult:.2f}x**")
     else:
         fear_mult = st.slider("Manual Multiplier", 0.5, 2.0, 1.0, 0.1)
     
     st.markdown("---")
 
-    # 3. Model Settings
     st.subheader("⚙️ Model Settings")
     mode = st.radio("Threshold Strategy", ["AI Auto-Pilot", "Manual Override"], index=0)
     manual_thresh = 0.10
@@ -252,7 +257,6 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # 4. Visual Aids
     st.subheader("👀 Visuals")
     show_forecast = st.toggle("Show Forecast", value=True)
     show_backtest = st.toggle("Show Backtest", value=False)
@@ -260,7 +264,6 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 # 4. EXECUTION & DASHBOARD
 # -----------------------------------------------------------------------------
-# Reload Data with final User Inputs
 raw_df, ai_stats = load_and_process_data(lookback_days=lookback, fear_mult=fear_mult)
 
 if raw_df is None:
@@ -278,7 +281,6 @@ last = df.iloc[-1]
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("VIX Level", f"{last['CLOSE']:.2f}", f"{last['CLOSE'] - df.iloc[-2]['CLOSE']:.2f}")
 c2.metric("Regime", str(last['regime']).upper(), delta_color="off")
-# Show Fear & Greed in Header
 c3.metric("Fear & Greed", f"{last['FNG']:.0f}")
 c4.metric("VPE Index", f"{last['VPE']:.0f}/100", "Energy")
 sig_icon = "🟢" if "BUY" in last['chart_signal'] else "🔴" if "SELL" in last['chart_signal'] else "⚪"
@@ -286,13 +288,13 @@ c5.metric("Model Signal", last['chart_signal'].replace("_", " "), sig_icon)
 
 with st.expander("ℹ️ How to read the Price & Signal Chart"):
     st.markdown("""
-    * **Purple Diamonds (VPE Buy):** Critical Energy (>90). The spring is coiled tight. Spike imminent.
+    * **Purple Diamonds (VPE Buy):** Critical Energy (>90). The spring is coiled tight.
     * **Orange Stars (Squeeze):** Low Volatility. Bands are tight.
-    * **Grey Cross (VPE Sell):** Energy Dissipated (<10). Market is dormant or exhausted.
-    * **Red Triangles (Sell Extreme):** Statistical Over-extension (Z-Score > 2).
+    * **Green Arrow (Buy Extreme):** VIX is statistically oversold (Z < -2.0).
+    * **Red Triangles (Sell Extreme):** Statistical Over-extension (Z > 2.0).
     """)
 
-# Updated to 5 Rows to accommodate F&G without removing VPE
+# 5 Charts (Price, Z, Squeeze, VPE, FNG)
 fig = make_subplots(
     rows=5, cols=1, shared_xaxes=True, 
     row_heights=[0.4, 0.15, 0.15, 0.15, 0.15], vertical_spacing=0.03,
@@ -317,8 +319,14 @@ if show_forecast:
     fig.add_trace(go.Scatter(x=f_df['DATE'], y=f_df['Forecast'], line=dict(dash='dash', color='yellow'), name='Median'), row=1, col=1)
 
 # Markers
-sigs = {'BUY_VPE': ('diamond', '#d500f9', 12), 'BUY_SQUEEZE': ('star', 'orange', 14), 
-        'SELL_VPE': ('cross', 'gray', 10), 'SELL_EXTREME': ('triangle-down', 'red', 10), 'BUY_VALUE': ('triangle-up', '#00ff00', 10)}
+sigs = {
+    'BUY_VPE': ('diamond', '#d500f9', 12), 
+    'BUY_SQUEEZE': ('star', 'orange', 14), 
+    'BUY_EXTREME': ('arrow-up', '#00ff00', 14), # NEW EXTREME SIGNAL
+    'BUY_VALUE': ('triangle-up', '#66bb6a', 10),
+    'SELL_VPE': ('cross', 'gray', 10), 
+    'SELL_EXTREME': ('triangle-down', 'red', 10)
+}
 
 for key, (sym, col, size) in sigs.items():
     d = df_filtered[df_filtered['chart_signal'] == key]
@@ -338,7 +346,7 @@ fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['VPE'], fill='toze
 fig.add_hline(y=90, line_dash="dot", line_color="red", row=4, col=1)
 fig.add_hline(y=10, line_dash="dot", line_color="gray", row=4, col=1)
 
-# 5. CNN Fear & Greed (New Row)
+# 5. CNN Fear & Greed
 fig.add_trace(go.Scatter(x=df_filtered['DATE'], y=df_filtered['FNG'], fill='tozeroy', line=dict(color='#00e5ff', width=2), name='Fear & Greed'), row=5, col=1)
 fig.add_hline(y=25, line_dash="dot", line_color="red", annotation_text="Fear", row=5, col=1)
 fig.add_hline(y=75, line_dash="dot", line_color="green", annotation_text="Greed", row=5, col=1)
@@ -353,6 +361,7 @@ st.dataframe(
     use_container_width=True, height=300, hide_index=True,
     column_config={
         "confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%d%%"),
-        "FNG": st.column_config.NumberColumn("Fear/Greed", format="%.0f")
+        "FNG": st.column_config.NumberColumn("Fear/Greed", format="%.0f"),
+        "VPE": st.column_config.NumberColumn("VPE Energy", format="%.0f")
     }
 )
