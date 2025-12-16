@@ -95,8 +95,7 @@ def load_and_process_data(lookback_days=20, fear_mult=1.0):
     df['spx_trend'] = np.where(df['SPX'] > df['spx_ma50'], "UPTREND", "FRAGILE")
     df['vvix_ma10'] = df['VVIX'].rolling(10).mean()
     
-    # --- FIXED REGIME CALCULATION (Prevents qcut crash) ---
-    # Using percentile rank is safer than qcut for data with many duplicates
+    # --- FIXED REGIME CALCULATION ---
     qtls = df["CLOSE"].rank(pct=True)
     df["regime"] = np.where(qtls < 0.25, "calm", 
                    np.where(qtls < 0.5, "normal",
@@ -145,32 +144,24 @@ def apply_signals(df, squeeze_threshold):
     cond_vpe_buy = df['VPE'] > 90
     cond_vpe_sell = df['VPE'] < 10
     
-    # Value Buys
-    cond_val = (df['z_score'] < -1.5) & (df['regime'].isin(['calm', 'normal']))
-    cond_buy_ext = (df['z_score'] < -2.0) # BUY EXTREME Logic
-    
+    cond_val = (df['z_score'] < -1.5) & (df['regime'] == 'calm')
+    cond_buy_ext = (df['z_score'] < -2.0)
     cond_sell_ext = (df['z_score'] > 2.0) | (df['rsi'] > 75)
     
     # Apply & Score
-    
-    # 1. Buy Value (Z < -1.5)
     df.loc[cond_val, 'chart_signal'] = 'BUY_VALUE'
     df.loc[cond_val, 'confidence'] = ((df.loc[cond_val, 'z_score'].abs() - 1.5) / 1.5).clip(0, 1) * 100
     
-    # 2. Buy Extreme (Z < -2.0) - Replaces Value if deeper
     df.loc[cond_buy_ext, 'chart_signal'] = 'BUY_EXTREME'
-    df.loc[cond_buy_ext, 'confidence'] = 100 # Maximum confidence
+    df.loc[cond_buy_ext, 'confidence'] = 100
     
-    # 3. Squeeze
     safe_thresh = learned_sqz_val if learned_sqz_val > 0 else 0.001
     df.loc[cond_sqz_final, 'chart_signal'] = 'BUY_SQUEEZE'
     df.loc[cond_sqz_final, 'confidence'] = ((safe_thresh - df.loc[cond_sqz_final, 'bb_width']) / safe_thresh).clip(0, 1) * 100
     
-    # 4. VPE (Master)
     df.loc[cond_vpe_buy, 'chart_signal'] = 'BUY_VPE'      
     df.loc[cond_vpe_buy, 'confidence'] = ((df.loc[cond_vpe_buy, 'VPE'] - 90) / 10).clip(0, 1) * 100
     
-    # 5. Sells
     df.loc[cond_vpe_sell, 'chart_signal'] = 'SELL_VPE'    
     df.loc[cond_vpe_sell, 'confidence'] = ((10 - df.loc[cond_vpe_sell, 'VPE']) / 10).clip(0, 1) * 100
     
@@ -215,9 +206,13 @@ def generate_forecast(data, days_ahead=21, num_sims=1000, regime_mode="Auto-Dete
 # -----------------------------------------------------------------------------
 # 3. SIDEBAR
 # -----------------------------------------------------------------------------
-# Pre-load for sidebar logic
-raw_df_preview, _ = load_and_process_data(20, 1.0) 
-latest_fng = raw_df_preview['FNG'].iloc[-1] if raw_df_preview is not None else 50
+# Pre-load for sidebar logic with SAFETY CHECK
+raw_df_preview, _ = load_and_process_data(20, 1.0)
+
+# FIX: Ensure we don't crash if data is empty
+latest_fng = 50
+if raw_df_preview is not None and not raw_df_preview.empty:
+    latest_fng = raw_df_preview['FNG'].iloc[-1]
 
 with st.sidebar:
     st.header("🎛️ Control Panel")
@@ -266,7 +261,8 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 raw_df, ai_stats = load_and_process_data(lookback_days=lookback, fear_mult=fear_mult)
 
-if raw_df is None:
+if raw_df is None or raw_df.empty:
+    st.error("⚠️ Data Loading Failed. This may be due to market hours or connectivity. Please refresh later.")
     st.stop()
 
 active_thresh = ai_stats['learned_threshold'] if mode == "AI Auto-Pilot" else manual_thresh
@@ -288,13 +284,12 @@ c5.metric("Model Signal", last['chart_signal'].replace("_", " "), sig_icon)
 
 with st.expander("ℹ️ How to read the Price & Signal Chart"):
     st.markdown("""
-    * **Purple Diamonds (VPE Buy):** Critical Energy (>90). The spring is coiled tight.
+    * **Purple Diamonds (VPE Buy):** Critical Energy (>90). The spring is coiled tight. Spike imminent.
     * **Orange Stars (Squeeze):** Low Volatility. Bands are tight.
     * **Green Arrow (Buy Extreme):** VIX is statistically oversold (Z < -2.0).
     * **Red Triangles (Sell Extreme):** Statistical Over-extension (Z > 2.0).
     """)
 
-# 5 Charts (Price, Z, Squeeze, VPE, FNG)
 fig = make_subplots(
     rows=5, cols=1, shared_xaxes=True, 
     row_heights=[0.4, 0.15, 0.15, 0.15, 0.15], vertical_spacing=0.03,
@@ -322,7 +317,7 @@ if show_forecast:
 sigs = {
     'BUY_VPE': ('diamond', '#d500f9', 12), 
     'BUY_SQUEEZE': ('star', 'orange', 14), 
-    'BUY_EXTREME': ('arrow-up', '#00ff00', 14), # NEW EXTREME SIGNAL
+    'BUY_EXTREME': ('arrow-up', '#00ff00', 14), 
     'BUY_VALUE': ('triangle-up', '#66bb6a', 10),
     'SELL_VPE': ('cross', 'gray', 10), 
     'SELL_EXTREME': ('triangle-down', 'red', 10)
@@ -361,7 +356,6 @@ st.dataframe(
     use_container_width=True, height=300, hide_index=True,
     column_config={
         "confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%d%%"),
-        "FNG": st.column_config.NumberColumn("Fear/Greed", format="%.0f"),
-        "VPE": st.column_config.NumberColumn("VPE Energy", format="%.0f")
+        "FNG": st.column_config.NumberColumn("Fear/Greed", format="%.0f")
     }
 )
